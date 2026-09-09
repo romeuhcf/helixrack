@@ -118,13 +118,17 @@ RSpec.describe "Phase 3: streaming response body gate" do
   # "always stopped before returning" guarantee is visible in one place.
   def with_rss_tracking(pid)
     peak_kb = 0
+    samples = 0
     stop = false
 
     monitor = Thread.new do
       Thread.current.report_on_exception = false
       until stop
         rss = read_vmrss_kb(pid)
-        peak_kb = rss if rss && rss > peak_kb
+        if rss
+          samples += 1
+          peak_kb = rss if rss > peak_kb
+        end
         sleep RSS_POLL_INTERVAL_SECONDS
       end
     end
@@ -135,6 +139,13 @@ RSpec.describe "Phase 3: streaming response body gate" do
       stop = true
       monitor.join
     end
+
+    # Without this, an unreadable /proc (a different OS, a sandboxed CI
+    # runner, a permissions issue) makes read_vmrss_kb return nil every
+    # time, peak_kb stays 0, and the RSS assertion passes having measured
+    # nothing -- once un-pended, the gate would pass without enforcing its
+    # actual bound.
+    raise "never read VmRSS for pid #{pid} -- /proc is unavailable, so the RSS bound was not measured" if samples.zero?
 
     [result, peak_kb]
   end

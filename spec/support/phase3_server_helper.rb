@@ -75,9 +75,18 @@ module Phase3
       end
     end
 
+    # A non-reaping liveness probe (signal 0 checks existence without
+    # delivering a signal) -- Process.waitpid(pid, WNOHANG) would work too,
+    # but it *reaps* an already-exited child as a side effect of checking,
+    # and this method is called from a retry loop (wait_until_ready!) where
+    # that reap could race with -- and duplicate -- the one ensure/reap
+    # below owns. Only that one call site may reap this pid; see reap's doc
+    # comment for why sending a signal to an already-reaped, possibly
+    # PID-reused process is the actual hazard being avoided here.
     def process_alive?(pid)
-      Process.waitpid(pid, Process::WNOHANG).nil?
-    rescue Errno::ECHILD
+      Process.kill(0, pid)
+      true
+    rescue Errno::ESRCH, Errno::ECHILD
       false
     end
 
@@ -91,19 +100,23 @@ module Phase3
     def fail_on_boot_timeout!(pid, port, deadline)
       return unless Time.now > deadline
 
-      reap(pid)
+      # No reap(pid) here -- with_helix_rack_subprocess's ensure is the sole
+      # place this pid gets reaped (see process_alive?'s doc comment).
       raise "helix_rack subprocess (pid #{pid}) never started listening on port #{port} " \
             "within #{BOOT_TIMEOUT_SECONDS}s"
     end
 
     # Kills the child and waits for it to actually exit, escalating to
-    # SIGKILL if it doesn't within `REAP_TIMEOUT_SECONDS` -- run from the
-    # example's `ensure` above, so this must not itself hang the suite on a
-    # child that refuses to die (no real signal-handling exists on this
-    # branch yet; Phase 8 is what teaches the server to trap SIGTERM, so
-    # today's default disposition -- terminate -- is expected to apply
-    # immediately, but the escalation path is here in case that ever
-    # changes).
+    # SIGKILL if it doesn't within `REAP_TIMEOUT_SECONDS`. Called from
+    # exactly one place -- with_helix_rack_subprocess's `ensure` -- and must
+    # stay that way: signaling a pid more than once, after it may have
+    # already exited, risks the OS having reused that pid for an unrelated
+    # process by the time a second call runs. Runs from an `ensure`, so this
+    # must not itself hang the suite on a child that refuses to die (no
+    # real signal-handling exists on this branch yet; Phase 8 is what
+    # teaches the server to trap SIGTERM, so today's default disposition --
+    # terminate -- is expected to apply immediately, but the escalation
+    # path is here in case that ever changes).
     def reap(pid)
       Process.kill("TERM", pid)
     rescue Errno::ESRCH
