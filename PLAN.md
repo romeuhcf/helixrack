@@ -37,19 +37,40 @@ keep-alive.
 
 ## Phase 2 — Rack `env` + CRuby invocation
 
-Wire `rb-sys`/`magnus`: build the Rack `env` Hash from the parsed request, acquire the GVL, call
-`.call(env)` on a loaded `config.ru` app, translate `[status, headers, body]` back to bytes.
+Wire `rb-sys`/`magnus`: build the Rack `env` Hash from the parsed request, call `.call(env)` on a
+loaded `config.ru` app, translate `[status, headers, body]` back to bytes.
 
-**Deliverable:** `helix_rack -a config.ru -p 8080` serving a real Rack app end-to-end.
+**Architecture note (why this phase needs no explicit GVL acquire/release):** the CLI entrypoint
+calls into a magnus function that runs the Tokio `current_thread` runtime via `block_on` on the
+*same* OS thread Ruby called it from — that thread already holds the GVL for the whole call, so
+`.call(env)` can happen directly without leaving it. Explicitly releasing the GVL around blocking
+I/O is Phase 5's job (RF06), not this one. This also means `Handler::call` is a synchronous,
+blocking Rust function: while it runs, the single-threaded runtime makes no progress on any other
+connection — expected and correct, since the GVL would serialize Ruby execution anyway.
+
+**Deliverable:** `helix_rack -a config.ru -p 8080` serving a real Rack app end-to-end, via a new
+pluggable `Handler` trait in `engine/` (Phase 1's `serve()` gains a handler parameter; Phase 1's
+three existing gates must still pass, byte-for-byte, using a trivial fixed-response `Handler` —
+this phase must not regress Phase 1).
 
 **Gate:**
 
 - **Rack::Lint** wraps the test app. Lint raises on any spec violation — pass/fail is binary, no
   interpretation needed.
-- An "echo" fixture app returns `env` as JSON. Run a table of crafted requests (varying verb,
-  path, query string, headers) and assert the returned JSON matches an expected fixture exactly
-  for every mandated key (`REQUEST_METHOD`, `PATH_INFO`, `QUERY_STRING`, `SERVER_NAME`,
-  `SERVER_PORT`, `rack.version`, `rack.input`, `rack.errors`, `rack.url_scheme`).
+- An "echo" fixture Rack app returns `env` as JSON, with two necessary adjustments since Rack env
+  values aren't all JSON-native: report `env['rack.input'].read` (the request body string) in
+  place of the `rack.input` IO object itself, and report `true` (env key present and responds to
+  `#puts`) in place of the `rack.errors` IO object. Run a table of crafted requests (varying verb,
+  path, query string, headers, and at least one request with a body) through the real compiled
+  server (a real TCP client against a booted `helix_rack` instance, not a mocked call) and assert
+  the returned JSON matches an expected fixture exactly for every mandated key
+  (`REQUEST_METHOD`, `PATH_INFO`, `QUERY_STRING`, `SERVER_NAME`, `SERVER_PORT`, `rack.version`,
+  the derived `rack.input` value above, the derived `rack.errors` value above, `rack.url_scheme`).
+- Bounded request body: a client that declares a `Content-Length` far larger than a fixed cap must
+  not make the server attempt to allocate a buffer that size. Past the cap, the server responds
+  `413 Payload Too Large` and closes the connection — before reading or allocating for the body,
+  not after. This is a different hazard from Phase 1's header-only Slowloris guard: a single
+  request with one oversized header value is enough here, not a sustained slow drip.
 
 ## Phase 3 — Streaming response body
 
