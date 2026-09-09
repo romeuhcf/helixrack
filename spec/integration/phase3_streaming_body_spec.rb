@@ -49,9 +49,17 @@ RSpec.describe "Phase 3: streaming response body gate" do
   # not to make the polling thread itself a meaningful CPU cost next to
   # actually moving ~200 MB.
   RSS_POLL_INTERVAL_SECONDS = 0.01
+
+  # `rake`'s default task (rubocop + rspec) is CI's required status check
+  # (this repo's CLAUDE.md, branch protection) -- a gate that's supposed to
+  # be red right now must not fail the build, the same reasoning and
+  # `pending:` mechanism as spec/integration/phase2_rack_env_spec.rb's
+  # PENDING_REASON. RSpec fails the suite instead the moment this starts
+  # passing without the marker being removed.
+  PENDING_REASON = "Phase 3 not implemented yet -- see PLAN.md (response bodies aren't spooled)"
   # rubocop:enable Lint/ConstantDefinitionInBlock
 
-  it "streams a large body correctly, within a bounded server RSS" do
+  it "streams a large body correctly, within a bounded server RSS", pending: PENDING_REASON do
     with_helix_rack_subprocess(APP_PATH) do |pid, port|
       (received_sha256, received_bytes), peak_rss_kb = with_rss_tracking(pid) { download_and_hash(port) }
 
