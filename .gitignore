@@ -15,3 +15,8 @@ target/
 
 # rspec failure tracking
 .rspec_status
+
+# gem libraries don't commit a lockfile; apps consuming this gem pin their own
+/Gemfile.lock
+/Cargo.lock
+
