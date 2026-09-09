@@ -8,6 +8,6 @@ RSpec.describe HelixRack do
   it "can call into Rust" do
     result = HelixRack.hello("world")
 
-    expect(result).to be("Hello earth, from Rust!")
+    expect(result).to eq("Hello world, from Rust!")
   end
 end
