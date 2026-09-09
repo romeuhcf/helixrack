@@ -36,6 +36,11 @@ Gem::Specification.new do |spec|
   # spec.add_dependency "example-gem", "~> 1.0"
   spec.add_dependency "rb_sys", "~> 0.9.128"
 
+  # Rack::Lint and the Phase 2 gate's fixture apps (spec/) need the `rack`
+  # gem; HelixRack's own runtime code does not depend on it (a Rack app is
+  # just any object responding to `#call(env)`), so this is development-only.
+  spec.add_development_dependency "rack", ">= 2.2"
+
   # For more information and examples about making a new gem, check out our
   # guide at: https://guides.rubygems.org/make-your-own-gem/
 end
