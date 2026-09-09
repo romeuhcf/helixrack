@@ -136,9 +136,20 @@ mod gvl {
     }
 
     /// Reacquires the GVL for the duration of `f`, so it can safely call
-    /// Ruby/magnus APIs. Only meaningful when called from inside a
-    /// [`without_gvl`] callback (running on the same OS thread) -- see
-    /// `rb_thread_call_with_gvl`'s own documented restriction.
+    /// Ruby/magnus APIs.
+    ///
+    /// # Safety (not enforced by the type system -- caller's responsibility)
+    ///
+    /// Must only be called from the same OS thread that is currently inside
+    /// a [`without_gvl`] callback on that thread (i.e. nested inside the
+    /// `f` passed to a `without_gvl` call still running on this thread).
+    /// This is `rb_thread_call_with_gvl`'s own documented restriction, not
+    /// one this module adds. Calling it from a thread that never released
+    /// the GVL via `without_gvl` is undefined behavior at the CRuby level
+    /// (not a panic, not a `Result::Err`) -- there is currently exactly one
+    /// call site (`RackAppHandler::call`), correctly nested; if a future
+    /// caller is added, re-verify this invariant by inspection, since
+    /// nothing here will catch a violation for you.
     pub(super) fn with_gvl<F, R>(f: F) -> R
     where
         F: FnOnce() -> R,
@@ -255,7 +266,7 @@ impl RackAppHandler {
         let (status, headers, body): (u16, RHash, Value) = app.funcall("call", (env,))?;
 
         let headers = headers.to_vec::<String, String>()?;
-        let body = read_body(body)?;
+        let body = read_body(&ruby, body)?;
 
         Ok(HandlerResponse {
             status,
@@ -285,6 +296,12 @@ thread_local! {
     /// `read_body`'s doc comment for why a thread-local instead of a
     /// captured closure.
     static BODY_CHUNKS: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+
+    /// Reentrancy guard for [`read_body`] -- see its doc comment. `true`
+    /// while a `read_body` call is between clearing and reading
+    /// [`BODY_CHUNKS`]; a nested call while `true` would otherwise
+    /// silently corrupt (not error on) the outer call's collected bytes.
+    static READING_BODY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The block passed to `body.each` by [`read_body`], via `Value::block_call`
@@ -330,8 +347,32 @@ fn collect_chunk(ruby: &Ruby, args: &[Value], _block: Option<magnus::block::Proc
 /// pointer (can't close over a local accumulator), so chunks are collected
 /// into the [`BODY_CHUNKS`] thread-local instead -- sound here because
 /// exactly one native OS thread ever runs Ruby code in this whole engine
-/// (PRD.md RNF01) and `read_body` never recurses into itself.
-fn read_body(body: Value) -> Result<Vec<u8>, Error> {
+/// (PRD.md RNF01) and, per [`READING_BODY`]'s guard below, `read_body`
+/// refuses to recurse into itself rather than silently corrupting a
+/// concurrently-in-progress call's collected bytes. Reentrancy is not
+/// hypothetical: a Rack app whose response body's `#each` itself triggers
+/// another request through this same server (e.g. by calling
+/// `HelixRack.serve` again, or, once Phase 3 exists, anything that pumps
+/// the event loop) would hit this without the guard.
+fn read_body(ruby: &Ruby, body: Value) -> Result<Vec<u8>, Error> {
+    if READING_BODY.with(|cell| cell.replace(true)) {
+        return Err(Error::new(
+            ruby.exception_runtime_error(),
+            "HelixRack: a Rack response body's #each triggered another request body read on \
+             the same thread before the first one finished -- refusing rather than silently \
+             corrupting either body",
+        ));
+    }
+    // Guard, not a bare bool reset at the end: `?` below can return early,
+    // and the flag must still come back down on that path too.
+    struct ResetOnDrop;
+    impl Drop for ResetOnDrop {
+        fn drop(&mut self) {
+            READING_BODY.with(|cell| cell.set(false));
+        }
+    }
+    let _reset = ResetOnDrop;
+
     BODY_CHUNKS.with(|cell| cell.borrow_mut().clear());
 
     let _: Value = body.block_call("each", (), collect_chunk)?;
@@ -402,4 +443,47 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let module = ruby.define_module("HelixRack")?;
     module.define_module_function("_serve_native", magnus::function!(_serve_native, 3))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rb_sys_test_helpers::ruby_test;
+
+    /// Exercises [`READING_BODY`]'s guard directly, rather than through
+    /// genuine Ruby-level reentrancy (a Rack body's `#each` recursively
+    /// calling back into `HelixRack.serve`) -- that would need a second
+    /// magnus-exposed entry point and a running server just to set up, when
+    /// the guard's own state machine is the actual unit this regression
+    /// protects. Simulates "already inside a `read_body` call" by setting
+    /// the flag directly before calling, matching what a real reentrant
+    /// call would see.
+    #[ruby_test]
+    fn read_body_rejects_reentrant_calls() {
+        let ruby = unsafe { Ruby::get_unchecked() };
+        let body: Value = ruby.eval(r#"["chunk"]"#).expect("build a one-element Array body");
+
+        READING_BODY.with(|cell| cell.set(true));
+        let result = read_body(&ruby, body);
+        READING_BODY.with(|cell| cell.set(false));
+
+        assert!(
+            result.is_err(),
+            "expected read_body to refuse a reentrant call, got: {result:?}"
+        );
+    }
+
+    #[ruby_test]
+    fn read_body_succeeds_normally_and_resets_the_guard_afterward() {
+        let ruby = unsafe { Ruby::get_unchecked() };
+        let body: Value = ruby.eval(r#"["a", "b"]"#).expect("build a two-element Array body");
+
+        let result = read_body(&ruby, body).expect("a non-reentrant call should succeed");
+
+        assert_eq!(result, b"ab");
+        assert!(
+            !READING_BODY.with(|cell| cell.get()),
+            "the guard must reset back to false after a normal call completes"
+        );
+    }
 }

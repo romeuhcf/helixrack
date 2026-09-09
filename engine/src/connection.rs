@@ -182,13 +182,6 @@ pub(crate) async fn handle(mut socket: TcpStream, handler: Rc<dyn Handler>) -> i
         // against `buf.len()` instead would let a later request's headers
         // balloon up to that leftover capacity before being rejected,
         // silently defeating this cap for the rest of the connection.
-        // Checked against `filled` (bytes buffered for THIS incomplete
-        // header parse), not `buf.len()` (the buffer's allocated capacity,
-        // which a prior request's body may have grown well past
-        // `MAX_BUF_CAPACITY` and which never shrinks back down). Comparing
-        // against `buf.len()` instead would let a later request's headers
-        // balloon up to that leftover capacity before being rejected,
-        // silently defeating this cap for the rest of the connection.
         if filled >= MAX_BUF_CAPACITY {
             socket.write_all(REQUEST_HEADER_FIELDS_TOO_LARGE).await?;
             return Ok(());
