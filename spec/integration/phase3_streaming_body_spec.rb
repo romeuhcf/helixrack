@@ -2,6 +2,7 @@
 
 require "digest"
 require "net/http"
+require "timeout"
 require_relative "../support/phase3_server_helper"
 require_relative "../fixtures/large_body_source"
 
@@ -57,6 +58,14 @@ RSpec.describe "Phase 3: streaming response body gate" do
   # not to make the polling thread itself a meaningful CPU cost next to
   # actually moving ~200 MB.
   RSS_POLL_INTERVAL_SECONDS = 0.01
+
+  # How long to wait for the RSS-polling thread's first successful sample
+  # before giving up and falling through to with_rss_tracking's own
+  # zero-samples check. Bounds the wait when /proc is genuinely
+  # unavailable (a clean failure instead of hanging), while being far more
+  # than the monitor thread should ever actually need to get scheduled and
+  # take one reading.
+  RSS_READY_TIMEOUT_SECONDS = 2
   # rubocop:enable Lint/ConstantDefinitionInBlock
 
   it "streams a large body correctly, within a bounded server RSS" do
@@ -119,25 +128,47 @@ RSpec.describe "Phase 3: streaming response body gate" do
   # byte, such as the current implementation's full server-side body
   # collection -- is covered, not just the time spent reading the HTTP
   # response.
-  # rubocop:disable Metrics/MethodLength -- the polling thread's setup and
-  # its `ensure`-guaranteed teardown belong together in one method so the
-  # "always stopped before returning" guarantee is visible in one place.
+  # rubocop:disable Metrics/MethodLength, Metrics/AbcSize -- the polling
+  # thread's setup and its `ensure`-guaranteed teardown belong together in
+  # one method so the "always stopped before returning" guarantee is
+  # visible in one place.
   def with_rss_tracking(pid)
     peak_kb = 0
     samples = 0
     stop = false
+    ready = Queue.new
 
+    # All mutation of samples/peak_kb happens on this one thread, never
+    # from the caller -- `ready.pop` below only *reads* whether the first
+    # sample landed, so there is nothing to synchronize on those two
+    # variables beyond the happens-before edge `monitor.join` already gives
+    # the caller once this loop exits.
     monitor = Thread.new do
       Thread.current.report_on_exception = false
-      until stop
+      # Sample first, check `stop` after: `Thread.new` returning doesn't
+      # guarantee this thread has actually started running yet, so without
+      # a readiness signal the caller's transfer could start (and finish
+      # part of its work) before the very first sample lands -- an
+      # unobserved early peak that the samples.zero? check below wouldn't
+      # catch, since it only proves *some* sample happened, not that
+      # sampling covered the whole transfer. Sampling before checking
+      # `stop` (rather than the reverse) also guarantees one last sample
+      # after the caller's transfer finishes, not just up to the previous
+      # poll tick.
+      loop do
         rss = read_vmrss_kb(pid)
         if rss
           samples += 1
           peak_kb = rss if rss > peak_kb
+          ready.push(true) if samples == 1
         end
+        break if stop
+
         sleep RSS_POLL_INTERVAL_SECONDS
       end
     end
+
+    wait_for_first_sample(ready)
 
     begin
       result = yield
@@ -155,7 +186,17 @@ RSpec.describe "Phase 3: streaming response body gate" do
 
     [result, peak_kb]
   end
-  # rubocop:enable Metrics/MethodLength
+  # rubocop:enable Metrics/MethodLength, Metrics/AbcSize
+
+  # Blocks until `ready` receives the monitor thread's first successful
+  # sample, or `RSS_READY_TIMEOUT_SECONDS` passes -- bounding the wait when
+  # /proc is genuinely unavailable (falls through to with_rss_tracking's
+  # own samples.zero? check for a clear error) instead of hanging forever.
+  def wait_for_first_sample(ready)
+    Timeout.timeout(RSS_READY_TIMEOUT_SECONDS) { ready.pop }
+  rescue Timeout::Error
+    nil
+  end
 
   # `pid`'s current resident set size, in kB, or `nil` if the process is
   # already gone (avoids a race against `with_helix_rack_subprocess`'s own
