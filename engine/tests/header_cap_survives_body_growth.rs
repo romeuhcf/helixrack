@@ -60,11 +60,22 @@ fn header_cap_is_not_widened_by_a_prior_large_body_on_the_same_connection() {
     // MB the buffer already grew to in step 1. If the cap were still being
     // checked against the buffer's capacity instead of bytes actually
     // buffered for this parse, this would sail through uncapped.
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .expect("set write timeout");
     let mut oversized_headers = b"GET / HTTP/1.1\r\nX-Filler: ".to_vec();
     oversized_headers.extend(std::iter::repeat_n(b'a', 200 * 1024));
-    stream
-        .write_all(&oversized_headers)
-        .expect("write oversized, never-completing headers on the reused connection");
+    // Same rationale as request_size_limit.rs: the server closes as soon as
+    // it hits the cap, so the tail of this write can legitimately fail.
+    match stream.write_all(&oversized_headers) {
+        Ok(()) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            ) => {}
+        Err(e) => panic!("unexpected error writing oversized headers: {e}"),
+    }
 
     let mut second_response = vec![0u8; HEADER_TOO_LARGE_RESPONSE.len()];
     stream

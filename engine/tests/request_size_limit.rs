@@ -28,15 +28,29 @@ fn oversized_request_gets_431_and_connection_close() {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("set read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .expect("set write timeout");
 
     // A request line plus a single header value large enough to blow past
     // any reasonable cap, with no terminating blank line -- the server must
     // never see a complete request here.
     let mut oversized = b"GET / HTTP/1.1\r\nX-Filler: ".to_vec();
     oversized.extend(std::iter::repeat_n(b'a', 200 * 1024));
-    stream
-        .write_all(&oversized)
-        .expect("write oversized, never-completing request");
+    // The server answers with 431 and closes as soon as it has buffered
+    // MAX_BUF_CAPACITY bytes -- well before this whole write lands on the
+    // wire, so the tail of it can legitimately fail once the server closes
+    // (BrokenPipe/ConnectionReset). That is the behavior under test, not a
+    // test bug; only the 431 read below is the actual assertion.
+    match stream.write_all(&oversized) {
+        Ok(()) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            ) => {}
+        Err(e) => panic!("unexpected error writing oversized request: {e}"),
+    }
 
     let mut actual = vec![0u8; TOO_LARGE_RESPONSE.len()];
     stream

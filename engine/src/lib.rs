@@ -16,8 +16,21 @@
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::net::TcpListener;
+
+/// Backoff before retrying `accept()` after it returns an error.
+///
+/// A single failed accept -- a transient per-connection error (e.g. the
+/// peer reset the connection before the kernel finished the handshake), or
+/// temporary resource pressure (e.g. the process is out of file
+/// descriptors) -- must not end the whole accept loop; the next client's
+/// connection attempt has nothing to do with why the last one failed. The
+/// backoff exists so a *persistently* failing `accept()` (e.g. sustained
+/// fd exhaustion) retries at a bounded rate instead of spinning the single
+/// OS thread this runtime owns at 100% CPU.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(10);
 
 mod connection;
 mod handler;
@@ -68,13 +81,24 @@ impl ConnectionCounter {
 /// one slow or idle connection doesn't block the accept loop from taking
 /// the next one -- this schedules concurrent tasks on the same OS thread,
 /// it does not spawn an OS thread or a multi-thread runtime.
+///
+/// A failed `accept()` never ends this loop -- see [`ACCEPT_ERROR_BACKOFF`].
+/// The only way `serve` returns is if `listener` itself is dropped out from
+/// under a concurrent `accept()` call, which does not happen in this
+/// crate's own callers.
 pub async fn serve(
     listener: TcpListener,
     connections: Arc<ConnectionCounter>,
     handler: Arc<dyn Handler>,
 ) -> io::Result<()> {
     loop {
-        let (socket, _peer_addr) = listener.accept().await?;
+        let (socket, _peer_addr) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(_) => {
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                continue;
+            }
+        };
         connections.record_accept();
         let handler = Arc::clone(&handler);
 
