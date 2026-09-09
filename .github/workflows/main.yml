@@ -32,3 +32,9 @@ jobs:
           rubygems: '4.0.16'
       - name: Run the default task
         run: bundle exec rake
+      - name: Run engine/ gate tests
+        run: cargo test --manifest-path engine/Cargo.toml
+      - name: Clippy (engine/)
+        run: cargo clippy --manifest-path engine/Cargo.toml --all-targets -- -D warnings
+      - name: Clippy (ext/helix_rack/)
+        run: cargo clippy --manifest-path ext/helix_rack/Cargo.toml --all-targets -- -D warnings
