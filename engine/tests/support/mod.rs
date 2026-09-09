@@ -4,6 +4,7 @@
 //! pulled into each integration test binary via `mod support;`.
 
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::thread;
 
@@ -89,19 +90,25 @@ pub fn spawn_server() -> TestServer {
         // context -- hence adopting the listener from within the same
         // `block_on` future rather than before it.
         //
+        // `serve` now takes `Rc<dyn Handler>` and spawns per-connection
+        // tasks with `tokio::task::spawn_local` (see `PLAN.md`'s Phase 2
+        // "Architecture note"), so the future has to be polled from inside
+        // a `LocalSet` for those spawns to have anywhere to schedule onto.
+        //
         // Deliberately ignoring the result: a correct `serve` runs forever
         // and only returns on a real I/O error, which would just end this
         // background thread with nothing to report it to.
-        let _ = runtime.block_on(async move {
+        let local_set = tokio::task::LocalSet::new();
+        let _ = runtime.block_on(local_set.run_until(async move {
             let tokio_listener = tokio::net::TcpListener::from_std(std_listener)
                 .expect("adopt std TcpListener into Tokio runtime");
             serve(
                 tokio_listener,
                 connections_for_thread,
-                Arc::new(FixedResponseHandler),
+                Rc::new(FixedResponseHandler),
             )
             .await
-        });
+        }));
     });
 
     TestServer { addr, connections }

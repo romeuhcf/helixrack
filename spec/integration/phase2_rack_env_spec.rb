@@ -24,22 +24,8 @@ require_relative "../fixtures/apps/echo_app"
 RSpec.describe "Phase 2: Rack env + CRuby invocation gate" do
   include Phase2::ServerHelper
 
-  # `pending`, not a plain failure: this suite runs as part of `rake`'s
-  # default task, which CI treats as a required check (see this repo's
-  # CLAUDE.md and branch protection). A gate that's *supposed* to be red
-  # right now must not fail the build -- `pending` reports these examples
-  # as yellow while HelixRack.serve raises NotImplementedError, and RSpec
-  # itself will fail the suite (a "pending examples fixed" error) the
-  # moment any of them starts passing without this marker being removed --
-  # exactly the nudge to delete it once Phase 2's real wiring lands.
-  # rubocop:disable Lint/ConstantDefinitionInBlock -- deliberately a real
-  # constant so it can be used as `it` metadata (`pending: PENDING_REASON`),
-  # which needs a value at spec-definition time, not inside an example.
-  PENDING_REASON = "Phase 2 not implemented yet -- see PLAN.md and lib/helix_rack.rb"
-  # rubocop:enable Lint/ConstantDefinitionInBlock
-
   describe "Rack::Lint compliance" do
-    it "raises no Rack::Lint violation for a basic GET /", pending: PENDING_REASON do
+    it "raises no Rack::Lint violation for a basic GET /" do
       with_helix_rack_server(Rack::Lint.new(Fixtures::EchoApp.new)) do |client|
         response = client.request(method: "GET", path: "/")
 
@@ -115,7 +101,7 @@ RSpec.describe "Phase 2: Rack env + CRuby invocation gate" do
     # rubocop:enable Metrics/MethodLength
 
     TABLE.each do |row|
-      it "reports the mandated env keys for: #{row[:label]}", pending: PENDING_REASON do
+      it "reports the mandated env keys for: #{row[:label]}" do
         with_helix_rack_server(Fixtures::EchoApp.new) do |client|
           response = client.request(
             method: row[:method],

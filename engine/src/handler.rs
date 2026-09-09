@@ -53,8 +53,14 @@ pub struct HandlerResponse {
 /// implementation runs the whole `current_thread` runtime on the same OS
 /// thread that already holds Ruby's GVL for the call it's servicing, so
 /// there is nothing to `.await` here and no GVL acquire/release logic
-/// belongs in this trait. `Send + Sync` so a single handler instance can be
-/// shared (via `Arc`) across every connection's task.
-pub trait Handler: Send + Sync {
+/// belongs in this trait.
+///
+/// No longer `Send + Sync` (see `PLAN.md`'s Phase 2 "Architecture note" on
+/// `Rc`, not `Arc`): a magnus-backed implementation holds a Ruby `Value`
+/// (the loaded app), and `magnus::Value` is not `Send`/`Sync` -- Ruby values
+/// can't cross threads without the VM's involvement. Since this whole engine
+/// only ever runs on one OS thread (PRD.md RNF01), a single handler instance
+/// is shared across every connection's task via `Rc`, not `Arc`.
+pub trait Handler {
     fn call(&self, req: &ParsedRequest<'_>) -> HandlerResponse;
 }

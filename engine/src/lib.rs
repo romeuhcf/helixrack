@@ -14,6 +14,7 @@
 //! [`ConnectionCounter`] the Phase 1 gate (`engine/tests/`) checks.
 
 use std::io;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,10 +78,14 @@ impl ConnectionCounter {
 /// writes the serialized response (HTTP/1.1 keep-alive: the connection
 /// stays open for the next request unless the client closes it).
 ///
-/// Each accepted connection is handled in its own `tokio::spawn`ed task so
-/// one slow or idle connection doesn't block the accept loop from taking
-/// the next one -- this schedules concurrent tasks on the same OS thread,
-/// it does not spawn an OS thread or a multi-thread runtime.
+/// Each accepted connection is handled in its own `tokio::task::spawn_local`
+/// task so one slow or idle connection doesn't block the accept loop from
+/// taking the next one -- this schedules concurrent tasks on the same OS
+/// thread, it does not spawn an OS thread or a multi-thread runtime.
+/// `spawn_local` (rather than `tokio::spawn`) is required because `handler`
+/// is `Rc<dyn Handler>`, not `Send` (see `Handler`'s doc comment); the
+/// caller must poll this future from inside a `tokio::task::LocalSet` for
+/// `spawn_local` to have anywhere to schedule onto.
 ///
 /// A failed `accept()` never ends this loop -- see [`ACCEPT_ERROR_BACKOFF`].
 /// The only way `serve` returns is if `listener` itself is dropped out from
@@ -89,7 +94,7 @@ impl ConnectionCounter {
 pub async fn serve(
     listener: TcpListener,
     connections: Arc<ConnectionCounter>,
-    handler: Arc<dyn Handler>,
+    handler: Rc<dyn Handler>,
 ) -> io::Result<()> {
     loop {
         let (socket, _peer_addr) = match listener.accept().await {
@@ -100,9 +105,9 @@ pub async fn serve(
             }
         };
         connections.record_accept();
-        let handler = Arc::clone(&handler);
+        let handler = Rc::clone(&handler);
 
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             // A single connection's read/write error must not affect any
             // other connection or the accept loop, so it's swallowed here.
             let _ = connection::handle(socket, handler).await;
