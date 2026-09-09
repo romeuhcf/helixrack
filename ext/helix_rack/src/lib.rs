@@ -7,6 +7,16 @@
 //! called it from, so `RackAppHandler::call` (below) can call into Ruby
 //! directly.
 //!
+//! Since Phase 3 (see `PLAN.md`, Phase 3 "Architecture decision"),
+//! [`read_body`] no longer unconditionally accumulates a whole Rack
+//! response body into one `Vec<u8>`: past [`SPOOL_THRESHOLD_BYTES`], it
+//! spills to a tempfile and returns `ResponseBody::Spooled` instead of
+//! `ResponseBody::InMemory`, so `engine`'s `connection::handle` can stream
+//! it back out to the socket in bounded chunks rather than needing the
+//! whole thing resident in RAM. See [`BodyAccumulator`] and
+//! [`SPOOL_THRESHOLD_BYTES`]'s own doc comments for the mechanism and the
+//! threshold choice.
+//!
 //! One deviation from that note, flagged prominently because the note is
 //! explicit that Phase 2 needs no GVL acquire/release logic: `_serve_native`
 //! releases the GVL (via [`gvl::without_gvl`]) for the whole time it's idle
@@ -31,6 +41,7 @@
 //! script's own process failed to exit afterwards (Ruby's shutdown couldn't
 //! reap the still-blocked server thread).
 
+use std::io::Write as _;
 use std::os::raw::c_void;
 use std::panic::{self, AssertUnwindSafe};
 use std::rc::Rc;
@@ -266,21 +277,17 @@ impl RackAppHandler {
         let (status, headers, body): (u16, RHash, Value) = app.funcall("call", (env,))?;
 
         let headers = headers.to_vec::<String, String>()?;
-        // `read_body` still fully concatenates every yielded chunk into one
-        // `Vec<u8>` in RAM (see its own doc comment) -- `engine`'s `Handler`
-        // trait gained a `ResponseBody::Spooled` variant in Phase 3 (see
-        // `PLAN.md`, Phase 3), but nothing on this side of the FFI boundary
-        // constructs one yet; that's real streaming's job, still to be
-        // built. Wrapping the fully-buffered result in `InMemory` here is
-        // the trivial adaptation Phase 3's engine-level refactor needs to
-        // keep compiling -- deliberately not a fix for the memory-bound
-        // half of Phase 3's gate.
+        // `read_body` (see its own doc comment) returns `InMemory` for a
+        // body that stayed under `SPOOL_THRESHOLD_BYTES`, or `Spooled` for
+        // one that crossed it -- either way, already the right
+        // `ResponseBody` variant for `engine`'s `Handler` trait, no further
+        // wrapping needed here.
         let body = read_body(&ruby, body)?;
 
         Ok(HandlerResponse {
             status,
             headers,
-            body: ResponseBody::InMemory(body),
+            body,
         })
     }
 }
@@ -300,24 +307,77 @@ impl Handler for RackAppHandler {
     }
 }
 
+/// How much of a Rack response body [`read_body`] will accumulate in memory
+/// before spilling the rest to a tempfile (see [`BodyAccumulator`] and
+/// `PLAN.md`'s Phase 3 "Architecture decision"). 1 MiB: PLAN.md leaves the
+/// exact number an implementation choice ("a few hundred KiB to low
+/// single-digit MiB"), and 1 MiB is a plain round number in the middle of
+/// that range. It's comfortably above typical small API/HTML response
+/// bodies (order of KB to low tens of KB) so the common case never touches
+/// disk at all -- the whole point of a threshold rather than always
+/// spooling -- while still being small enough that even a request that
+/// does cross it (this phase's ~200 MB fixture included) spends only a
+/// trivial, bounded amount of RAM before switching to the tempfile path for
+/// the rest of the body.
+const SPOOL_THRESHOLD_BYTES: usize = 1024 * 1024;
+
+/// [`read_body`]'s accumulator: a Rack response body starts `InMemory` and
+/// stays there for as long as its accumulated size is under
+/// [`SPOOL_THRESHOLD_BYTES`]; the first chunk that would push it over
+/// switches to `Spooled`, writing what had accumulated so far plus that
+/// chunk to a fresh tempfile, and every chunk after that is written
+/// straight to the same file instead of growing memory further. See
+/// `PLAN.md`'s Phase 3 "Architecture decision" for why this shape (spool
+/// only once a body is *proven* large) was chosen over the two rejected
+/// alternatives.
+enum BodyAccumulator {
+    /// Bytes accumulated so far. Every chunk of a body that never crosses
+    /// [`SPOOL_THRESHOLD_BYTES`] ends up here and only here -- no tempfile
+    /// is ever created for such a body.
+    InMemory(Vec<u8>),
+    /// The body has crossed [`SPOOL_THRESHOLD_BYTES`]; every chunk from
+    /// here on (including the one that triggered the switch) is written
+    /// straight to this file rather than into a growing `Vec`.
+    ///
+    /// Created via `tempfile::tempfile()`, not `tempfile::NamedTempFile`:
+    /// confirmed by reading the `tempfile` 3.27.0 crate's own source
+    /// (`src/file/mod.rs`'s `tempfile`/`tempfile_in`, `src/file/imp/unix.rs`'s
+    /// `create`) that on Linux it opens the file with `O_TMPFILE` -- an
+    /// anonymous inode with no directory entry ever created in the first
+    /// place -- falling back, only on filesystems that reject `O_TMPFILE`
+    /// (`EOPNOTSUPP`/`EISDIR`/`ENOENT`), to create-then-immediately-`unlink`
+    /// (`create_unlinked`), which leaves no directory entry either by the
+    /// time this function returns. Either path means there is no
+    /// cleanup-on-every-exit-path lifecycle to manage beyond the returned
+    /// `File` being dropped normally (which closes its fd; the OS reclaims
+    /// the space once the last fd to the anonymous/unlinked inode closes)
+    /// -- directly eliminating the disk-cleanup tradeoff PLAN.md's
+    /// Phase 3 "Architecture decision" flagged as a real cost of this
+    /// design.
+    Spooled(std::fs::File),
+}
+
 thread_local! {
     /// Scratch space for [`read_body`]'s [`collect_chunk`] callback -- see
     /// `read_body`'s doc comment for why a thread-local instead of a
-    /// captured closure.
-    static BODY_CHUNKS: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// captured closure. Reset to `InMemory(Vec::new())` at the start of
+    /// every `read_body` call.
+    static BODY_ACCUMULATOR: std::cell::RefCell<BodyAccumulator> =
+        const { std::cell::RefCell::new(BodyAccumulator::InMemory(Vec::new())) };
 
     /// Reentrancy guard for [`read_body`] -- see its doc comment. `true`
-    /// while a `read_body` call is between clearing and reading
-    /// [`BODY_CHUNKS`]; a nested call while `true` would otherwise
+    /// while a `read_body` call is between resetting and reading
+    /// [`BODY_ACCUMULATOR`]; a nested call while `true` would otherwise
     /// silently corrupt (not error on) the outer call's collected bytes.
     static READING_BODY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The block passed to `body.each` by [`read_body`], via `Value::block_call`
 /// (a plain, non-capturing `fn` pointer -- see that function's doc comment
-/// for why it can't just close over a local `Vec<u8>`). Appends the bytes of
-/// each yielded chunk (must be a `String`, per the Rack Body contract) to
-/// [`BODY_CHUNKS`].
+/// for why it can't just close over a local accumulator). Appends the bytes
+/// of each yielded chunk (must be a `String`, per the Rack Body contract) to
+/// [`BODY_ACCUMULATOR`], spilling to a tempfile the moment doing so would
+/// push it past [`SPOOL_THRESHOLD_BYTES`] (see [`spool_chunk`]).
 fn collect_chunk(ruby: &Ruby, args: &[Value], _block: Option<magnus::block::Proc>) -> Result<(), Error> {
     let Some(&chunk) = args.first() else {
         return Err(Error::new(
@@ -326,20 +386,58 @@ fn collect_chunk(ruby: &Ruby, args: &[Value], _block: Option<magnus::block::Proc
         ));
     };
     let chunk = RString::try_convert(chunk)?;
-    BODY_CHUNKS.with(|cell| {
-        // SAFETY: the slice is copied out (`extend_from_slice`) before any
-        // other Ruby call that could mutate or free `chunk` gets a chance
-        // to run.
-        unsafe {
-            cell.borrow_mut().extend_from_slice(chunk.as_slice());
+    BODY_ACCUMULATOR.with(|cell| {
+        // SAFETY: the slice is only read (copied into `buf`, or written out
+        // to a file, never retained past this call) before any other Ruby
+        // call that could mutate or free `chunk` gets a chance to run --
+        // same invariant this callback has always relied on, now inside
+        // `spool_chunk`. Neither `tempfile::tempfile()` nor `File::write_all`
+        // call back into Ruby.
+        unsafe { spool_chunk(ruby, &mut cell.borrow_mut(), chunk.as_slice()) }
+    })
+}
+
+/// Appends one yielded chunk's `bytes` to `acc` (see [`BodyAccumulator`]):
+/// while still `InMemory`, grows the buffer in place unless doing so would
+/// push the accumulated total past [`SPOOL_THRESHOLD_BYTES`], in which case
+/// it spills everything accumulated so far -- plus `bytes` -- to a fresh
+/// tempfile and switches `acc` to `Spooled` for the rest of this body; once
+/// `Spooled`, every further chunk (this one included, on the transition
+/// call) is written straight to that file instead.
+///
+/// File I/O (`tempfile::tempfile()`, `write_all`) can fail (disk full,
+/// permissions) -- surfaced here as a real `magnus::Error`, matching the
+/// pattern this file already uses elsewhere for I/O failures, rather than
+/// panicking or silently dropping bytes.
+fn spool_chunk(ruby: &Ruby, acc: &mut BodyAccumulator, bytes: &[u8]) -> Result<(), Error> {
+    let io_error = |e: std::io::Error| Error::new(ruby.exception_runtime_error(), e.to_string());
+
+    match acc {
+        BodyAccumulator::InMemory(buf) => {
+            if buf.len() + bytes.len() > SPOOL_THRESHOLD_BYTES {
+                let mut file = tempfile::tempfile().map_err(io_error)?;
+                file.write_all(buf).map_err(io_error)?;
+                file.write_all(bytes).map_err(io_error)?;
+                *acc = BodyAccumulator::Spooled(file);
+            } else {
+                buf.extend_from_slice(bytes);
+            }
         }
-    });
+        BodyAccumulator::Spooled(file) => {
+            file.write_all(bytes).map_err(io_error)?;
+        }
+    }
     Ok(())
 }
 
 /// Reads a Rack body (an object responding to `#each`, most commonly an
-/// `Array` of `String`s in this phase -- no streaming yet, that's Phase 3)
-/// by calling `#each` and concatenating every yielded chunk's bytes.
+/// `Array` of `String`s for a small response, or an `Enumerator`-like
+/// object yielding many chunks for a large/streaming one) by calling
+/// `#each` and accumulating every yielded chunk's bytes -- either fully in
+/// memory, or spooled to a tempfile past [`SPOOL_THRESHOLD_BYTES`] (see
+/// [`BodyAccumulator`] and `PLAN.md`'s Phase 3 "Architecture decision").
+/// Returns the resulting [`ResponseBody`] directly: `InMemory` for a body
+/// that never crossed the threshold, `Spooled` for one that did.
 ///
 /// Uses `Value::block_call` (a real Ruby block passed to `#each`, run
 /// synchronously on the same call stack), not `Value::enumeratorize`
@@ -354,16 +452,16 @@ fn collect_chunk(ruby: &Ruby, args: &[Value], _block: Option<magnus::block::Proc
 /// experiences" with), but `block_call` sidesteps it entirely by never
 /// creating a `Fiber`. `block_call`'s block is a plain, non-capturing `fn`
 /// pointer (can't close over a local accumulator), so chunks are collected
-/// into the [`BODY_CHUNKS`] thread-local instead -- sound here because
+/// into the [`BODY_ACCUMULATOR`] thread-local instead -- sound here because
 /// exactly one native OS thread ever runs Ruby code in this whole engine
 /// (PRD.md RNF01) and, per [`READING_BODY`]'s guard below, `read_body`
 /// refuses to recurse into itself rather than silently corrupting a
 /// concurrently-in-progress call's collected bytes. Reentrancy is not
 /// hypothetical: a Rack app whose response body's `#each` itself triggers
 /// another request through this same server (e.g. by calling
-/// `HelixRack.serve` again, or, once Phase 3 exists, anything that pumps
-/// the event loop) would hit this without the guard.
-fn read_body(ruby: &Ruby, body: Value) -> Result<Vec<u8>, Error> {
+/// `HelixRack.serve` again, or anything else that pumps the event loop)
+/// would hit this without the guard.
+fn read_body(ruby: &Ruby, body: Value) -> Result<ResponseBody, Error> {
     if READING_BODY.with(|cell| cell.replace(true)) {
         return Err(Error::new(
             ruby.exception_runtime_error(),
@@ -372,21 +470,35 @@ fn read_body(ruby: &Ruby, body: Value) -> Result<Vec<u8>, Error> {
              corrupting either body",
         ));
     }
-    // Guard, not a bare bool reset at the end: `?` below can return early,
-    // and the flag must still come back down on that path too.
+    // Guard, not a bare reset at the end: `?` below can return early, and
+    // both the reentrancy flag and any partial accumulator state must come
+    // back down on that path too -- otherwise a chunk write failing mid-
+    // spool (disk full, fd exhaustion) would leave BODY_ACCUMULATOR holding
+    // an open fd on a partially-written tempfile until the *next*
+    // read_body call happens to overwrite it (line below), rather than
+    // freeing it as soon as this request is done with it. On the success
+    // path this just re-overwrites an already-fresh-empty accumulator
+    // (harmless) after the real result has already been taken out below.
     struct ResetOnDrop;
     impl Drop for ResetOnDrop {
         fn drop(&mut self) {
             READING_BODY.with(|cell| cell.set(false));
+            BODY_ACCUMULATOR.with(|cell| *cell.borrow_mut() = BodyAccumulator::InMemory(Vec::new()));
         }
     }
     let _reset = ResetOnDrop;
 
-    BODY_CHUNKS.with(|cell| cell.borrow_mut().clear());
+    BODY_ACCUMULATOR.with(|cell| *cell.borrow_mut() = BodyAccumulator::InMemory(Vec::new()));
 
     let _: Value = body.block_call("each", (), collect_chunk)?;
 
-    Ok(BODY_CHUNKS.with(|cell| std::mem::take(&mut *cell.borrow_mut())))
+    Ok(BODY_ACCUMULATOR.with(|cell| {
+        let taken = std::mem::replace(&mut *cell.borrow_mut(), BodyAccumulator::InMemory(Vec::new()));
+        match taken {
+            BodyAccumulator::InMemory(buf) => ResponseBody::InMemory(buf),
+            BodyAccumulator::Spooled(file) => ResponseBody::Spooled(file),
+        }
+    }))
 }
 
 /// `HelixRack._serve_native(app, port, bind)` (see `lib/helix_rack.rb`):
@@ -489,10 +601,57 @@ mod tests {
 
         let result = read_body(&ruby, body).expect("a non-reentrant call should succeed");
 
-        assert_eq!(result, b"ab");
+        match result {
+            ResponseBody::InMemory(bytes) => assert_eq!(bytes, b"ab"),
+            ResponseBody::Spooled(_) => {
+                panic!("a 2-byte body is far under SPOOL_THRESHOLD_BYTES, expected InMemory")
+            }
+        }
         assert!(
             !READING_BODY.with(|cell| cell.get()),
             "the guard must reset back to false after a normal call completes"
         );
+    }
+
+    /// Exercises the actual spill-to-tempfile path (see [`BodyAccumulator`],
+    /// [`spool_chunk`]): a body whose accumulated bytes cross
+    /// [`SPOOL_THRESHOLD_BYTES`] must come back as `ResponseBody::Spooled`,
+    /// with the file's contents matching every chunk yielded, in order --
+    /// not just "spooled to *some* file", since a wrong offset/ordering bug
+    /// in `spool_chunk` wouldn't otherwise be caught by
+    /// `read_body_succeeds_normally_and_resets_the_guard_afterward` above
+    /// (that test's body never crosses the threshold).
+    #[ruby_test]
+    fn read_body_spills_to_a_tempfile_past_the_threshold() {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let ruby = unsafe { Ruby::get_unchecked() };
+        // Two chunks whose combined length exceeds SPOOL_THRESHOLD_BYTES --
+        // a single Ruby String literal that size would be unwieldy to write
+        // out here, so this builds it via `"x" * n` instead.
+        let chunk_len = SPOOL_THRESHOLD_BYTES;
+        let body: Value = ruby
+            .eval(&format!(r#"["x" * {chunk_len}, "y" * {chunk_len}]"#))
+            .expect("build a two-chunk Array body that crosses the spool threshold");
+
+        let result = read_body(&ruby, body).expect("a non-reentrant call should succeed");
+
+        let mut file = match result {
+            ResponseBody::Spooled(file) => file,
+            ResponseBody::InMemory(bytes) => panic!(
+                "expected Spooled once the body's {} bytes crossed SPOOL_THRESHOLD_BYTES \
+                 ({SPOOL_THRESHOLD_BYTES}), got InMemory({} bytes)",
+                chunk_len * 2,
+                bytes.len()
+            ),
+        };
+
+        file.seek(SeekFrom::Start(0)).expect("seek spooled file to start");
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).expect("read spooled file contents");
+
+        let mut expected = vec![b'x'; chunk_len];
+        expected.extend(vec![b'y'; chunk_len]);
+        assert_eq!(contents, expected);
     }
 }
