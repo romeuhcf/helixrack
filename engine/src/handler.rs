@@ -39,11 +39,39 @@ pub struct ParsedRequest<'req> {
 /// Owned, unlike [`ParsedRequest`]: it may still be alive after the
 /// connection has moved its read buffer around for the next pipelined
 /// request, so it can't borrow from that buffer.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct HandlerResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
+    pub body: ResponseBody,
+}
+
+/// A [`HandlerResponse`]'s body: either fully in memory, or spooled to a
+/// file and streamed back out (see `PLAN.md`'s Phase 3 "Architecture
+/// decision" for why a tempfile rather than raw-fd writes or pull-based
+/// `Enumerator`/`Fiber` iteration -- both considered and rejected there).
+///
+/// No `Clone`/`Copy`: `std::fs::File` isn't `Clone` (it wraps a raw OS file
+/// descriptor, not cheaply duplicable data), and nothing in this crate has
+/// needed to clone a `HandlerResponse` since Phase 1 -- dropped along with
+/// this enum's addition rather than worked around.
+#[derive(Debug)]
+pub enum ResponseBody {
+    /// The whole body already in RAM, written to the socket in one
+    /// `write_all` call -- Phase 1/2's only case, and unchanged behavior
+    /// for it now that it's a named variant instead of the field's whole
+    /// type.
+    InMemory(Vec<u8>),
+    /// The body's bytes live in this file. `connection::handle`'s
+    /// body-writing step does not assume any particular file position on
+    /// entry -- it seeks to the start explicitly before reading -- so a
+    /// caller may hand over a file it just finished writing (cursor at EOF)
+    /// without rewinding it first. Read back out and written to the socket
+    /// in bounded chunks via async tokio file I/O, never loaded into memory
+    /// all at once (that would defeat the entire point of this variant --
+    /// see `PLAN.md`'s Phase 3 gate: bounded server RSS regardless of body
+    /// size).
+    Spooled(std::fs::File),
 }
 
 /// Produces the response for one parsed request.

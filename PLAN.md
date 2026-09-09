@@ -101,6 +101,38 @@ this phase must not regress Phase 1).
 
 Bodies are written to the socket incrementally (via `each`), not buffered fully in RAM.
 
+**Architecture decision (tempfile spooling, chosen over two riskier alternatives):** three designs
+were considered for how a Ruby response body's `#each` (push-based) gets to the socket (async,
+tokio) without buffering the whole thing in RAM:
+
+1. **Chosen: spool to a tempfile, stream that async.** `collect_chunk`-style code writes each
+   yielded chunk to a Rust-managed tempfile synchronously as `#each` produces it -- safe because
+   `Handler::call` already blocks the whole runtime synchronously for its entire duration (Phase
+   2's established, accepted model), so a blocking `File::write_all` here is no riskier than what
+   already happens for the rest of the Ruby call. `connection::handle` then reads the file back out
+   to the socket in bounded chunks via normal async tokio file I/O -- a well-trodden pattern, no
+   interference with tokio's internal socket I/O-driver bookkeeping. Real tradeoffs: disk I/O
+   overhead for large bodies, and a tempfile lifecycle to manage (create, guarantee cleanup on
+   every exit path including error/panic, and disk space is itself a finite resource that could be
+   exhausted -- typically far larger than RAM, but not infinite, and not yet bounded by any cap the
+   way `MAX_BUF_CAPACITY`/`MAX_BODY_CAPACITY` bound memory).
+2. Rejected for now: raw-fd synchronous writes straight to the socket (convert the tokio
+   `TcpStream` to its raw fd temporarily, write each chunk directly, bypassing tokio's async write
+   path for the body entirely). No disk I/O, closest to true incremental streaming to the client --
+   but doing raw writes behind tokio's back while it still owns the socket's I/O driver/epoll
+   registration is a correctness trap that's hard to fully verify by review.
+3. Rejected: pull-based Fiber/`Enumerator` iteration, matching Rack's body contract most naturally
+   (pull one chunk at a time from a lazy producer). This is the same family of approach Phase 2
+   already tried for a different purpose and hit an unexplained hang with a `Rack::Lint::Wrapper`
+   body -- not attempted again without first understanding that hang.
+
+**Flagged as a future improvement candidate, not a final answer:** option 1's disk I/O overhead is
+a real cost this project's own KPIs (PRD.md section 2.2: P99 latency, RSS) will eventually care
+about. Revisit once there's a concrete, measured perf need (Phase 13's benchmarking, or later) --
+either by understanding and fixing option 3's hang (the more idiomatic long-term design), or by a
+more carefully-verified version of option 2. Do not silently swap this out later without updating
+this note and re-running the safety review that approved it.
+
 **Deliverable:** large/streaming Rack bodies (e.g. an `Enumerator` yielding chunks) serve
 correctly.
 

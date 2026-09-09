@@ -36,7 +36,7 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(10);
 mod connection;
 mod handler;
 
-pub use handler::{Handler, HandlerResponse, ParsedRequest};
+pub use handler::{Handler, HandlerResponse, ParsedRequest, ResponseBody};
 
 /// Counts how many TCP connections the engine has *accepted* (not how many
 /// requests it has served) since a given `serve` call started.

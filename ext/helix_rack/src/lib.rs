@@ -43,7 +43,7 @@ use magnus::prelude::*;
 use magnus::value::Opaque;
 use magnus::{Error, RClass, RHash, RString, Ruby, Value};
 
-use helixrack_engine::{serve, ConnectionCounter, Handler, HandlerResponse, ParsedRequest};
+use helixrack_engine::{serve, ConnectionCounter, Handler, HandlerResponse, ParsedRequest, ResponseBody};
 
 /// Minimal `rb_thread_call_without_gvl`/`rb_thread_call_with_gvl` wrappers
 /// (see this module's top doc comment for why they're here). Neither is
@@ -266,12 +266,21 @@ impl RackAppHandler {
         let (status, headers, body): (u16, RHash, Value) = app.funcall("call", (env,))?;
 
         let headers = headers.to_vec::<String, String>()?;
+        // `read_body` still fully concatenates every yielded chunk into one
+        // `Vec<u8>` in RAM (see its own doc comment) -- `engine`'s `Handler`
+        // trait gained a `ResponseBody::Spooled` variant in Phase 3 (see
+        // `PLAN.md`, Phase 3), but nothing on this side of the FFI boundary
+        // constructs one yet; that's real streaming's job, still to be
+        // built. Wrapping the fully-buffered result in `InMemory` here is
+        // the trivial adaptation Phase 3's engine-level refactor needs to
+        // keep compiling -- deliberately not a fix for the memory-bound
+        // half of Phase 3's gate.
         let body = read_body(&ruby, body)?;
 
         Ok(HandlerResponse {
             status,
             headers,
-            body,
+            body: ResponseBody::InMemory(body),
         })
     }
 }
@@ -285,7 +294,7 @@ impl Handler for RackAppHandler {
             self.handle(req).unwrap_or_else(|_err| HandlerResponse {
                 status: 500,
                 headers: Vec::new(),
-                body: Vec::new(),
+                body: ResponseBody::InMemory(Vec::new()),
             })
         })
     }
