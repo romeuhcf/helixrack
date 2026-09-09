@@ -25,15 +25,31 @@ module Fixtures
 
     module_function
 
+    # A single ~1 MiB pseudo-random buffer, generated once at load time and
+    # reused (mutated, not reallocated) by every `chunk` call below -- see
+    # `chunk`'s comment for why. Safe as shared mutable state: every caller
+    # in this codebase (the fixture app's `#each`, `sha256_hexdigest`) is
+    # single-threaded and consumes a yielded chunk immediately (copies or
+    # hashes its bytes) without retaining a reference past that call.
+    @buffer = Random.new(0xDEADBEEF).bytes(CHUNK_SIZE)
+
     # The bytes for chunk `index` (0-based), always exactly `CHUNK_SIZE`
-    # bytes long. Built by repeating a 32-byte SHA-256 digest of the index
-    # until it fills the chunk -- deterministic, and well-distributed rather
-    # than e.g. a single repeated byte (which could accidentally pass a
-    # sloppy correctness check that isn't really comparing content).
+    # bytes long: the shared `@buffer` above, with its first 32 bytes
+    # overwritten by a SHA-256 digest of `index` -- deterministic and
+    # different per chunk (catching e.g. chunks delivered out of order,
+    # dropped, or duplicated -- all change the overall SHA-256 this
+    # fixture's callers compare), without the original implementation's
+    # per-call cost: repeating a digest to fill a fresh ~1 MiB string on
+    # every single call allocated roughly 2 MiB of garbage per chunk (a
+    # `String#*` repeat plus a slice), 200 times, and that churn alone was
+    # large enough to swamp the Phase 3 gate's RSS measurement -- confirmed
+    # by reproducing chunk generation standalone, no server involved, and
+    # watching RSS climb by tens of MB. Only mutating a 32-byte region of an
+    # already-allocated buffer, 200 times, costs none of that.
     def chunk(index)
-      seed = Digest::SHA256.digest("helixrack-phase3-fixture-chunk-#{index}")
-      repeated = seed * ((CHUNK_SIZE / seed.bytesize) + 1)
-      repeated[0, CHUNK_SIZE].force_encoding(Encoding::BINARY)
+      fingerprint = Digest::SHA256.digest("helixrack-phase3-fixture-chunk-#{index}")
+      @buffer[0, fingerprint.bytesize] = fingerprint
+      @buffer
     end
 
     # Yields every chunk in order. Neither caller (the fixture app's `#each`
