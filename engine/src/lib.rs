@@ -7,17 +7,17 @@
 //! requests with `httparse` (zero-copy), and answers with a fixed 200
 //! response, keeping the connection open for HTTP/1.1 keep-alive.
 //!
-//! This file is a skeleton: it defines the public API shape the Phase 1 gate
-//! (`engine/tests/`) is written against, but the request-parsing/response
-//! logic itself is intentionally unimplemented (`todo!()`). Filling it in is
-//! separate follow-up work (the phase-builder step), not part of writing the
-//! gate.
+//! The actual request parsing lives in [`connection`]; this file owns the
+//! accept loop and the [`ConnectionCounter`] the Phase 1 gate
+//! (`engine/tests/`) checks.
 
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
+
+mod connection;
 
 /// Counts how many TCP connections the engine has *accepted* (not how many
 /// requests it has served) since a given `serve` call started.
@@ -40,10 +40,8 @@ impl ConnectionCounter {
         self.0.load(Ordering::SeqCst)
     }
 
-    /// Records that one more connection was accepted.
-    ///
-    /// Not called anywhere yet -- the accept loop that would call this is
-    /// part of the real Phase 1 implementation, not this skeleton.
+    /// Records that one more connection was accepted. Called once per
+    /// accepted connection by [`serve`]'s accept loop.
     pub fn record_accept(&self) {
         self.0.fetch_add(1, Ordering::SeqCst);
     }
@@ -51,17 +49,28 @@ impl ConnectionCounter {
 
 /// Runs the Phase 1 engine loop against an already-bound `listener`.
 ///
-/// Intended real behavior (not implemented here): accept connections in a
-/// loop on a Tokio `current_thread` runtime, call
-/// [`ConnectionCounter::record_accept`] once per accepted connection, then on
-/// that connection read and `httparse`-parse HTTP/1.1 requests zero-copy from
-/// a reusable buffer, writing the same fixed 200 response for each one
-/// (HTTP/1.1 keep-alive: the connection stays open for the next request
-/// unless the client closes it).
+/// Accepts connections in a loop on whatever (single-threaded, per PRD.md
+/// section 5) Tokio runtime this future is polled on, calls
+/// [`ConnectionCounter::record_accept`] once per accepted connection, then
+/// hands the connection to [`connection::handle`], which reads and
+/// `httparse`-parses HTTP/1.1 requests zero-copy from a reusable buffer,
+/// writing the same fixed 200 response for each one (HTTP/1.1 keep-alive:
+/// the connection stays open for the next request unless the client closes
+/// it).
 ///
-/// This skeleton body is deliberately unimplemented so the Phase 1 gate in
-/// `engine/tests/` compiles and fails for the right reason (this `todo!()`)
-/// until the phase-builder step fills in the real logic.
-pub async fn serve(_listener: TcpListener, _connections: Arc<ConnectionCounter>) -> io::Result<()> {
-    todo!("Phase 1: accept loop + httparse request parsing + fixed 200 response, see PLAN.md")
+/// Each accepted connection is handled in its own `tokio::spawn`ed task so
+/// one slow or idle connection doesn't block the accept loop from taking
+/// the next one -- this schedules concurrent tasks on the same OS thread,
+/// it does not spawn an OS thread or a multi-thread runtime.
+pub async fn serve(listener: TcpListener, connections: Arc<ConnectionCounter>) -> io::Result<()> {
+    loop {
+        let (socket, _peer_addr) = listener.accept().await?;
+        connections.record_accept();
+
+        tokio::spawn(async move {
+            // A single connection's read/write error must not affect any
+            // other connection or the accept loop, so it's swallowed here.
+            let _ = connection::handle(socket).await;
+        });
+    }
 }
