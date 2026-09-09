@@ -101,20 +101,28 @@ this phase must not regress Phase 1).
 
 Bodies are written to the socket incrementally (via `each`), not buffered fully in RAM.
 
-**Architecture decision (tempfile spooling, chosen over two riskier alternatives):** three designs
+**Architecture decision (spill-to-tempfile past a size threshold, chosen over two riskier
+alternatives):** three designs
 were considered for how a Ruby response body's `#each` (push-based) gets to the socket (async,
 tokio) without buffering the whole thing in RAM:
 
-1. **Chosen: spool to a tempfile, stream that async.** `collect_chunk`-style code writes each
-   yielded chunk to a Rust-managed tempfile synchronously as `#each` produces it -- safe because
-   `Handler::call` already blocks the whole runtime synchronously for its entire duration (Phase
-   2's established, accepted model), so a blocking `File::write_all` here is no riskier than what
-   already happens for the rest of the Ruby call. `connection::handle` then reads the file back out
-   to the socket in bounded chunks via normal async tokio file I/O -- a well-trodden pattern, no
-   interference with tokio's internal socket I/O-driver bookkeeping. Real tradeoffs: disk I/O
-   overhead for large bodies, and a tempfile lifecycle to manage (create, guarantee cleanup on
-   every exit path including error/panic, and disk space is itself a finite resource that could be
-   exhausted -- typically far larger than RAM, but not infinite, and not yet bounded by any cap the
+1. **Chosen: spool to a tempfile only once a body is *proven* large, stream that async.**
+   `collect_chunk`-style code accumulates yielded chunks in memory as `#each` produces them, same
+   as today -- up to a fixed threshold (e.g. a few hundred KiB to low single-digit MiB; the exact
+   number is an implementation choice, not re-litigated here). Only once that threshold is crossed
+   does it spill to a Rust-managed tempfile: write what's accumulated so far, then every subsequent
+   chunk, straight to the file instead of growing the in-memory buffer further. A body that never
+   crosses the threshold stays `ResponseBody::InMemory` and never touches disk at all -- the common
+   case (small API/HTML responses) pays no tempfile cost; only the rare large body does. Writing to
+   the tempfile is safe because `Handler::call` already blocks the whole runtime synchronously for
+   its entire duration (Phase 2's established, accepted model), so a blocking `File::write_all` here
+   is no riskier than what already happens for the rest of the Ruby call. `connection::handle` then
+   reads a spooled file back out to the socket in bounded chunks via normal async tokio file I/O --
+   a well-trodden pattern, no interference with tokio's internal socket I/O-driver bookkeeping. Real
+   tradeoffs, now scoped to only the large-body path: disk I/O overhead for large bodies, and a
+   tempfile lifecycle to manage (create, guarantee cleanup on every exit path including error/panic,
+   and disk space is itself a finite resource that could be exhausted -- typically far larger than
+   RAM, but not infinite, and not yet bounded by any cap the
    way `MAX_BUF_CAPACITY`/`MAX_BODY_CAPACITY` bound memory).
 2. Rejected for now: raw-fd synchronous writes straight to the socket (convert the tokio
    `TcpStream` to its raw fd temporarily, write each chunk directly, bypassing tokio's async write
