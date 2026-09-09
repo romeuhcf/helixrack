@@ -30,6 +30,10 @@ keep-alive.
 - Keep-alive proof: a test client opens **one** TCP connection, sends N sequential requests,
   asserts N responses come back on that same socket (no reconnect) and that a connection counter
   the test server exposes shows exactly 1 connection accepted for the whole run.
+- Bounded read buffer: a client that sends header bytes without ever completing a request (no
+  terminating blank line) must not grow the server's per-connection buffer without limit. Past a
+  fixed cap, the server responds `431 Request Header Fields Too Large` and closes the connection —
+  asserted by byte-exact response and a subsequent EOF, not by watching memory use.
 
 ## Phase 2 — Rack `env` + CRuby invocation
 

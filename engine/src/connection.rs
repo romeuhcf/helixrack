@@ -23,6 +23,19 @@ const RESPONSE: &[u8] =
 /// headers don't fit yet -- Phase 1's fixtures are all well under this.
 const INITIAL_BUF_CAPACITY: usize = 8 * 1024;
 
+/// Hard cap on the per-connection read buffer. Without this, a client that
+/// sends header bytes without ever completing a request (no terminating
+/// blank line) grows the buffer without limit -- a Slowloris-style memory
+/// exhaustion vector. 64 KiB is generous for legitimate headers (well past
+/// nginx's 8 KiB default) while keeping worst-case per-connection memory
+/// bounded.
+const MAX_BUF_CAPACITY: usize = 64 * 1024;
+
+/// Sent, then the connection is closed, when a request would need a buffer
+/// larger than `MAX_BUF_CAPACITY` to complete.
+const REQUEST_HEADER_FIELDS_TOO_LARGE: &[u8] =
+    b"HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\n";
+
 /// Maximum number of headers `httparse` parses per request.
 const MAX_HEADERS: usize = 64;
 
@@ -65,9 +78,16 @@ pub(crate) async fn handle(mut socket: TcpStream) -> io::Result<()> {
         }
 
         if filled == buf.len() {
-            // The buffered partial request doesn't fit -- grow and keep
-            // reading rather than failing a request that's merely large.
-            let new_capacity = buf.len() * 2;
+            if buf.len() >= MAX_BUF_CAPACITY {
+                // The request still isn't complete at the cap -- reject it
+                // rather than growing the buffer without limit.
+                socket.write_all(REQUEST_HEADER_FIELDS_TOO_LARGE).await?;
+                return Ok(());
+            }
+            // The buffered partial request doesn't fit yet -- grow (capped)
+            // and keep reading rather than failing a request that's merely
+            // large.
+            let new_capacity = (buf.len() * 2).min(MAX_BUF_CAPACITY);
             buf.resize(new_capacity, 0);
         }
 
