@@ -1,0 +1,78 @@
+//! Shared test scaffolding for the Phase 1 gate (see `PLAN.md`, Phase 1).
+//!
+//! Not part of the crate's public API -- this lives under `tests/` and is
+//! pulled into each integration test binary via `mod support;`.
+
+use std::net::{SocketAddr, TcpListener as StdTcpListener};
+use std::sync::Arc;
+use std::thread;
+
+use helixrack_engine::{serve, ConnectionCounter};
+
+/// The exact bytes the Phase 1 fixed response is expected to be, for every
+/// request in the fixture corpus and every request in the keep-alive run.
+///
+/// PLAN.md / PRD.md do not pin down the literal response bytes -- only that
+/// `GET /` gets "a fixed 200 response". This constant is the gate's concrete
+/// choice for what that response is; the phase-builder implementation must
+/// match it byte-for-byte.
+pub const EXPECTED_RESPONSE: &[u8] =
+    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK";
+
+/// A handle to a Phase 1 engine running on a background OS thread, bound to
+/// an ephemeral localhost port.
+///
+/// `connections` is only read by the keep-alive gate
+/// (`engine/tests/keep_alive.rs`); since this module is compiled once per
+/// integration-test binary, the fixture-corpus binary sees it as unused.
+#[allow(dead_code)]
+pub struct TestServer {
+    pub addr: SocketAddr,
+    pub connections: Arc<ConnectionCounter>,
+}
+
+/// Binds an ephemeral TCP port, hands it to [`helixrack_engine::serve`] on a
+/// dedicated OS thread running its own Tokio `current_thread` runtime (per
+/// PRD.md section 5's single-threaded-runtime architecture), and returns
+/// immediately with the address to connect to.
+///
+/// The spawned thread is intentionally not joined: a correctly implemented
+/// `serve` never returns for the life of the test process. Today, since
+/// `serve` is `todo!()`, that thread panics almost immediately after being
+/// polled; that panic is confined to the background thread and surfaces to
+/// the test only indirectly, as a failed connect/read/assertion on the
+/// client side -- which is the point of this gate before Phase 1 is built.
+pub fn spawn_server() -> TestServer {
+    let std_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind ephemeral test port");
+    let addr = std_listener
+        .local_addr()
+        .expect("read local_addr of freshly bound test listener");
+    std_listener
+        .set_nonblocking(true)
+        .expect("set test listener non-blocking for adoption into Tokio");
+
+    let connections = Arc::new(ConnectionCounter::new());
+    let connections_for_thread = Arc::clone(&connections);
+
+    thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("build current_thread Tokio runtime for test server");
+
+        // `TcpListener::from_std` registers the socket with the runtime's
+        // I/O driver immediately, so it must run inside the runtime's
+        // context -- hence adopting the listener from within the same
+        // `block_on` future rather than before it.
+        //
+        // Deliberately ignoring the result: a correct `serve` runs forever;
+        // today it panics (`todo!()`) and that panic just ends this thread.
+        let _ = runtime.block_on(async move {
+            let tokio_listener = tokio::net::TcpListener::from_std(std_listener)
+                .expect("adopt std TcpListener into Tokio runtime");
+            serve(tokio_listener, connections_for_thread).await
+        });
+    });
+
+    TestServer { addr, connections }
+}

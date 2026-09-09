@@ -1,0 +1,15 @@
+[package]
+name = "helixrack-engine"
+version = "0.1.0"
+edition = "2021"
+authors = ["Romeu Fonseca <romeu.hcf@gmail.com>"]
+license = "MIT"
+publish = false
+description = "Phase 1: raw HTTP/1.1 engine (Tokio current_thread + httparse), no Ruby/CRuby involvement."
+
+[lib]
+name = "helixrack_engine"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "net"] }

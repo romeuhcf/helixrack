@@ -3,7 +3,7 @@
 # in the ext/ directory.
 
 [workspace]
-members = ["./ext/helix_rack"]
+members = ["./ext/helix_rack", "./engine"]
 resolver = "2"
 
 [profile.release]
