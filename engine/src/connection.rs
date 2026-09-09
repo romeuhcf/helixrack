@@ -5,14 +5,22 @@
 //! caller-supplied [`Handler`] synchronously, and serializes whatever
 //! [`HandlerResponse`] comes back into real HTTP/1.1 response bytes.
 //! Phase 1's bounded-read-buffer / 431 behavior is unchanged.
+//!
+//! Since Phase 3 (see `PLAN.md`, Phase 3), the response body is written in
+//! two possible ways depending on [`ResponseBody`]: an [`ResponseBody::InMemory`]
+//! body is written in one `write_all`, same as always; a
+//! [`ResponseBody::Spooled`] one is streamed back out to the socket in
+//! bounded chunks (see [`write_body`]) instead of being read into memory
+//! whole. The status-line-and-headers front matter (see [`serialize_head`])
+//! doesn't change either way.
 
 use std::io;
 use std::rc::Rc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::handler::{Handler, HandlerResponse, ParsedRequest};
+use crate::handler::{Handler, HandlerResponse, ParsedRequest, ResponseBody};
 
 /// Initial size of the per-connection read buffer. Doubled if a request's
 /// headers don't fit yet -- Phase 1's fixtures are all well under this.
@@ -165,8 +173,9 @@ pub(crate) async fn handle(mut socket: TcpStream, handler: Rc<dyn Handler>) -> i
             };
 
             let response = handler.call(&parsed_request);
-            let response_bytes = serialize_response(&response);
-            socket.write_all(&response_bytes).await?;
+            let head = serialize_head(&response);
+            socket.write_all(&head).await?;
+            write_body(&mut socket, &response.body).await?;
 
             // Shift any bytes after this request (start of the next
             // pipelined request, if any) down to the front, without
@@ -266,12 +275,14 @@ fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
-/// Serializes a [`HandlerResponse`] into real HTTP/1.1 response bytes: a
-/// status line with a reason phrase, the given headers verbatim (no
+/// Serializes a [`HandlerResponse`]'s front matter into real HTTP/1.1 bytes:
+/// a status line with a reason phrase, the given headers verbatim (no
 /// injected `Content-Length` or similar -- the handler is responsible for
-/// every header it wants sent), a blank line, then the body.
-fn serialize_response(response: &HandlerResponse) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(response.body.len() + 128);
+/// every header it wants sent), then a blank line. The body is a separate
+/// step ([`write_body`]) since, as of Phase 3, it isn't always already a
+/// byte slice sitting in memory to append here.
+fn serialize_head(response: &HandlerResponse) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(128);
     bytes.extend_from_slice(
         format!(
             "HTTP/1.1 {} {}\r\n",
@@ -287,6 +298,54 @@ fn serialize_response(response: &HandlerResponse) -> Vec<u8> {
         bytes.extend_from_slice(b"\r\n");
     }
     bytes.extend_from_slice(b"\r\n");
-    bytes.extend_from_slice(&response.body);
     bytes
+}
+
+/// Chunk size used when streaming a [`ResponseBody::Spooled`] file back out
+/// to the socket. 128 KiB: this whole path exists (`PLAN.md`'s Phase 3 gate)
+/// to keep server RSS from scaling with body size, so the chunk buffer
+/// itself must stay a fixed, small cost regardless of how large the spooled
+/// file is -- 128 KiB is a rounding error next to `MAX_BODY_CAPACITY`'s 10
+/// MiB inbound cap, let alone the multi-hundred-MB bodies this path is for.
+/// It's also comfortably above typical filesystem/socket buffer and MTU
+/// sizes (so the loop isn't dominated by per-chunk read()/write() syscall
+/// and task-wakeup overhead the way a tiny e.g. 4 KiB chunk would be),
+/// without being so large that one chunk read starves the event loop for
+/// a noticeable stretch on a single-threaded runtime (PRD.md RNF01) --
+/// 64 KiB-256 KiB is the generally reasonable range for this tradeoff, and
+/// 128 KiB is the middle of it.
+const SPOOLED_BODY_CHUNK_SIZE: usize = 128 * 1024;
+
+/// Writes a [`HandlerResponse`]'s body to `socket`: [`ResponseBody::InMemory`]
+/// in one `write_all` (unchanged Phase 1/2 behavior); [`ResponseBody::Spooled`]
+/// read back out of its file and written in [`SPOOLED_BODY_CHUNK_SIZE`]-sized
+/// chunks via async tokio file I/O, never reading the whole spooled file into
+/// memory at once.
+async fn write_body(socket: &mut TcpStream, body: &ResponseBody) -> io::Result<()> {
+    match body {
+        ResponseBody::InMemory(bytes) => socket.write_all(bytes).await,
+        ResponseBody::Spooled(file) => {
+            // `tokio::fs::File` doesn't wrap a borrowed `&std::fs::File` --
+            // it owns its handle -- so a duplicate OS-level file descriptor
+            // (sharing the same underlying file and, notably, seek
+            // position) is what lets this read from the file without taking
+            // ownership of the `std::fs::File` living in `body`/`response`.
+            let duplicated = file.try_clone()?;
+            let mut spooled = tokio::fs::File::from_std(duplicated);
+            // `ResponseBody::Spooled`'s doc comment makes no promise about
+            // the incoming file position (e.g. a freshly-written file's
+            // cursor sits at EOF, not the start) -- rewind explicitly rather
+            // than trust the caller.
+            spooled.seek(io::SeekFrom::Start(0)).await?;
+
+            let mut chunk = vec![0u8; SPOOLED_BODY_CHUNK_SIZE];
+            loop {
+                let read = spooled.read(&mut chunk).await?;
+                if read == 0 {
+                    return Ok(());
+                }
+                socket.write_all(&chunk[..read]).await?;
+            }
+        }
+    }
 }

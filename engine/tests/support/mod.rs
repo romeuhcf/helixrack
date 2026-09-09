@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::thread;
 
-use helixrack_engine::{serve, ConnectionCounter, Handler, HandlerResponse, ParsedRequest};
+use helixrack_engine::{serve, ConnectionCounter, Handler, HandlerResponse, ParsedRequest, ResponseBody};
 
 /// The exact bytes the Phase 1 fixed response is expected to be, for every
 /// request in the fixture corpus and every request in the keep-alive run.
@@ -43,7 +43,7 @@ impl Handler for FixedResponseHandler {
                 ("Content-Length".to_string(), "2".to_string()),
                 ("Connection".to_string(), "keep-alive".to_string()),
             ],
-            body: b"OK".to_vec(),
+            body: ResponseBody::InMemory(b"OK".to_vec()),
         }
     }
 }
