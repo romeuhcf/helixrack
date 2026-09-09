@@ -48,6 +48,19 @@ I/O is Phase 5's job (RF06), not this one. This also means `Handler::call` is a 
 blocking Rust function: while it runs, the single-threaded runtime makes no progress on any other
 connection — expected and correct, since the GVL would serialize Ruby execution anyway.
 
+**Architecture note (`Rc`, not `Arc`; `spawn_local`, not `spawn`):** a magnus-backed `Handler` holds
+a Ruby `Value` (the loaded app) so it can call `.call(env)` on it -- and `magnus::Value` is not
+`Send`/`Sync` (Ruby values can't cross threads without the VM's involvement, and magnus enforces
+this at the type level). `engine`'s original `Handler: Send + Sync` bound, `Arc<dyn Handler>`, and
+`tokio::spawn` per connection were written for Phase 1's single hardcoded response, which had
+nothing to make non-`Send`. Since this whole engine only ever runs on one OS thread anyway (PRD.md
+RNF01), there was never real cross-thread sharing to justify atomics or `Send`. The real Phase 2
+implementation drops `Send + Sync` from `Handler`, switches `Arc<dyn Handler>` to `Rc<dyn Handler>`,
+and switches `serve`'s per-connection `tokio::spawn` to `tokio::task::spawn_local` inside a
+`tokio::task::LocalSet` (the caller -- both the test harness and the real magnus entry point --
+wraps its `block_on` in `LocalSet::new().run_until(...)`). `ConnectionCounter` stays `Arc<AtomicUsize>`
+unchanged; nothing about it needed the relaxation.
+
 **Deliverable:** `helix_rack -a config.ru -p 8080` serving a real Rack app end-to-end, via a new
 pluggable `Handler` trait in `engine/` (Phase 1's `serve()` gains a handler parameter; Phase 1's
 three existing gates must still pass, byte-for-byte, using a trivial fixed-response `Handler` —
