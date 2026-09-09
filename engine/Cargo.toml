@@ -12,4 +12,5 @@ name = "helixrack_engine"
 path = "src/lib.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "net"] }
+tokio = { version = "1", features = ["rt", "net", "io-util"] }
+httparse = "1"

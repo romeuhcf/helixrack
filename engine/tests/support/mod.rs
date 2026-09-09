@@ -16,6 +16,11 @@ use helixrack_engine::{serve, ConnectionCounter};
 /// `GET /` gets "a fixed 200 response". This constant is the gate's concrete
 /// choice for what that response is; the phase-builder implementation must
 /// match it byte-for-byte.
+///
+/// Unused by `request_size_limit.rs` (it expects a 431, not this); since
+/// this module is compiled once per integration-test binary, that binary
+/// sees it as unused.
+#[allow(dead_code)]
 pub const EXPECTED_RESPONSE: &[u8] =
     b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK";
 
