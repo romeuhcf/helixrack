@@ -12,6 +12,8 @@ crate-type = ["cdylib"]
 [dependencies]
 magnus = { version = "0.8.2" }
 rb-sys = { version = "0.9", features = ["stable-api-compiled-fallback"] }
+helixrack-engine = { path = "../../engine" }
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros"] }
 
 [build-dependencies]
 rb-sys-env = "0.2.2"

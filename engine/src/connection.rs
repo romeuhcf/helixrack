@@ -7,7 +7,7 @@
 //! Phase 1's bounded-read-buffer / 431 behavior is unchanged.
 
 use std::io;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -71,7 +71,7 @@ const MAX_HEADERS: usize = 64;
 /// parse error occurs. The caller (the `serve` accept loop) runs this per
 /// connection independently, so one connection's error doesn't affect
 /// others.
-pub(crate) async fn handle(mut socket: TcpStream, handler: Arc<dyn Handler>) -> io::Result<()> {
+pub(crate) async fn handle(mut socket: TcpStream, handler: Rc<dyn Handler>) -> io::Result<()> {
     let mut buf = vec![0u8; INITIAL_BUF_CAPACITY];
     let mut filled = 0usize;
 
@@ -175,13 +175,6 @@ pub(crate) async fn handle(mut socket: TcpStream, handler: Arc<dyn Handler>) -> 
             filled -= body_end;
         }
 
-        // Checked against `filled` (bytes buffered for THIS incomplete
-        // header parse), not `buf.len()` (the buffer's allocated capacity,
-        // which a prior request's body may have grown well past
-        // `MAX_BUF_CAPACITY` and which never shrinks back down). Comparing
-        // against `buf.len()` instead would let a later request's headers
-        // balloon up to that leftover capacity before being rejected,
-        // silently defeating this cap for the rest of the connection.
         // Checked against `filled` (bytes buffered for THIS incomplete
         // header parse), not `buf.len()` (the buffer's allocated capacity,
         // which a prior request's body may have grown well past

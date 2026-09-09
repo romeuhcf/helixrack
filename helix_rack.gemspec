@@ -36,10 +36,15 @@ Gem::Specification.new do |spec|
   # spec.add_dependency "example-gem", "~> 1.0"
   spec.add_dependency "rb_sys", "~> 0.9.128"
 
-  # Rack::Lint and the Phase 2 gate's fixture apps (spec/) need the `rack`
-  # gem; HelixRack's own runtime code does not depend on it (a Rack app is
-  # just any object responding to `#call(env)`), so this is development-only.
-  spec.add_development_dependency "rack", ">= 2.2"
+  # exe/helix_rack loads config.ru via Rack::Builder.parse_file -- a real
+  # runtime dependency, not just a test one (Rack::Lint and the Phase 2
+  # gate's fixture apps also use it, but that alone would only need a
+  # development dependency). Constrained to what's actually been verified:
+  # Rack::Builder.parse_file's return shape changed between major versions
+  # (Rack 1.x/2.x returned [app, options]; Rack 3 returns the app directly,
+  # confirmed by reading the installed rack-3.2.7's source) -- only the
+  # Rack 3 shape has been checked against this code.
+  spec.add_dependency "rack", ">= 3.0"
 
   # For more information and examples about making a new gem, check out our
   # guide at: https://guides.rubygems.org/make-your-own-gem/

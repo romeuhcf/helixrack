@@ -40,13 +40,38 @@ keep-alive.
 Wire `rb-sys`/`magnus`: build the Rack `env` Hash from the parsed request, call `.call(env)` on a
 loaded `config.ru` app, translate `[status, headers, body]` back to bytes.
 
-**Architecture note (why this phase needs no explicit GVL acquire/release):** the CLI entrypoint
-calls into a magnus function that runs the Tokio `current_thread` runtime via `block_on` on the
-*same* OS thread Ruby called it from — that thread already holds the GVL for the whole call, so
-`.call(env)` can happen directly without leaving it. Explicitly releasing the GVL around blocking
-I/O is Phase 5's job (RF06), not this one. This also means `Handler::call` is a synchronous,
-blocking Rust function: while it runs, the single-threaded runtime makes no progress on any other
-connection — expected and correct, since the GVL would serialize Ruby execution anyway.
+**Architecture note (GVL — revised from this phase's original plan):** the CLI entrypoint calls
+into a magnus function that runs the Tokio `current_thread` runtime via `block_on` on the *same* OS
+thread Ruby called it from, so `.call(env)` can happen directly without leaving it — `Handler::call`
+is a synchronous, blocking Rust function, and while it runs the single-threaded runtime makes no
+progress on any other connection (expected and correct, since the GVL would serialize Ruby
+execution anyway). This phase was originally planned with *no* GVL release at all (that was to be
+Phase 5/RF06's job), on the assumption that a real deployment has no other Ruby thread competing
+for it. Real implementation found that assumption incomplete: the GVL is cooperative, and a thread
+that never releases it also starves Ruby's own signal-handling checkpoints and `Thread#kill` — both
+needed for Phase 8's graceful shutdown, and needed right now just to make the Phase 2 gate's test
+harness (which boots the server on a background `Thread` and drives/kills it from another) work at
+all without hanging forever. So Phase 2 ships a coarse GVL release: released for the idle/accept
+portion of the run (`rb_thread_call_without_gvl`, magnus 0.8.2 doesn't wrap it, called directly via
+raw `rb-sys`), reacquired (`rb_thread_call_with_gvl`) only around each request's `Handler::call`.
+This is *not* Phase 5's deliverable — no per-read/write granularity, no drain/grace-period shutdown
+(Phase 8), a polled (20ms) rather than instant cancellation — Phase 5's job narrows to upgrading
+this coarse release to fine-grained I/O-boundary release plus the RF07 preemption mechanism, not
+introducing GVL release from scratch. See `ext/helix_rack/src/lib.rs`'s `gvl` module for the full
+reasoning and the direct reproduction that found the original no-release plan hangs indefinitely.
+
+**Architecture note (`Rc`, not `Arc`; `spawn_local`, not `spawn`):** a magnus-backed `Handler` holds
+a Ruby `Value` (the loaded app) so it can call `.call(env)` on it -- and `magnus::Value` is not
+`Send`/`Sync` (Ruby values can't cross threads without the VM's involvement, and magnus enforces
+this at the type level). `engine`'s original `Handler: Send + Sync` bound, `Arc<dyn Handler>`, and
+`tokio::spawn` per connection were written for Phase 1's single hardcoded response, which had
+nothing to make non-`Send`. Since this whole engine only ever runs on one OS thread anyway (PRD.md
+RNF01), there was never real cross-thread sharing to justify atomics or `Send`. The real Phase 2
+implementation drops `Send + Sync` from `Handler`, switches `Arc<dyn Handler>` to `Rc<dyn Handler>`,
+and switches `serve`'s per-connection `tokio::spawn` to `tokio::task::spawn_local` inside a
+`tokio::task::LocalSet` (the caller -- both the test harness and the real magnus entry point --
+wraps its `block_on` in `LocalSet::new().run_until(...)`). `ConnectionCounter` stays `Arc<AtomicUsize>`
+unchanged; nothing about it needed the relaxation.
 
 **Deliverable:** `helix_rack -a config.ru -p 8080` serving a real Rack app end-to-end, via a new
 pluggable `Handler` trait in `engine/` (Phase 1's `serve()` gains a handler parameter; Phase 1's
@@ -107,6 +132,14 @@ correctly.
 
 GVL held only for `.call(env)`; released during socket read/write and idle wait.
 
+**Narrowed scope (Phase 2 shipped a coarse version early):** Phase 2's real implementation already
+had to add `rb_thread_call_without_gvl`/`_with_gvl` release around the whole idle/accept portion of
+the run, for reasons unrelated to this phase (see Phase 2's GVL architecture note) — coarse-grained,
+released once per `_serve_native` call rather than per read/write. This phase's job is narrower than
+originally scoped: upgrade that release to per-I/O-operation granularity (so a slow client blocked
+mid-read doesn't hold the GVL any longer than Phase 1-4's connection-handling loop actually needs
+it), not introduce GVL release from scratch.
+
 **Deliverable:** correct `rb_thread_call_without_gvl` usage around I/O.
 
 **Gate — avoid sleep-based flakiness, use synchronization instead:**
@@ -132,6 +165,18 @@ latency-based.
 
 Ruby exceptions → HTTP 500. Rust panics caught (`catch_unwind`), never crash the process.
 
+**Narrowed scope (Phase 2 shipped a minimal version early):** `RackAppHandler::handle`
+(`ext/helix_rack/src/lib.rs`) already turns any magnus/Ruby-side `Result::Err` (a raised exception,
+a failed type conversion) into a bare `500` with no body — otherwise nothing in `engine`'s `Handler`
+trait had anywhere to put an error, since it has no `Result` in its signature. This phase's real
+deliverable is the parts that minimal version doesn't cover: a real error body/logging story, and
+real panic *recovery*: today a panic inside `RackAppHandler::handle` does get caught, by
+`ext/helix_rack/src/lib.rs`'s `gvl::trampoline` (every `gvl::with_gvl`/`without_gvl` call is wrapped
+in `catch_unwind`), but the only safe thing that boundary can do with a caught panic is abort the
+whole process — unwinding further across the `extern "C"` frame back into Ruby is unsound. This
+phase's job is to add an *inner* `catch_unwind` around just `RackAppHandler::handle`'s Ruby-calling
+logic (inside the FFI boundary, not at it), so a panic there can become a `500` instead of an abort.
+
 **Deliverable:** no exception or panic can bring the server down.
 
 **Gate:** a fixture app with a table of fault modes (raises `StandardError`, raises
@@ -142,6 +187,15 @@ the very next unrelated request still succeeds with `200`. All three are exact a
 ## Phase 8 — Graceful shutdown (RNF05)
 
 SIGTERM/SIGINT: stop accepting, drain in-flight requests within a grace period, exit.
+
+**Builds on Phase 2's `gvl::without_gvl` cancellation:** `_serve_native` already races `serve`
+against a polled (20ms) `cancel` flag flipped by an unblock function (`ext/helix_rack/src/lib.rs`)
+-- built so `Thread#kill` could stop the server during tests, not for SIGTERM handling. This phase
+wires a real `Signal.trap("TERM")`/`"INT"` (Ruby-side, in `lib/helix_rack.rb` or `exe/helix_rack`)
+to the same cancellation path, then adds the actual deliverable: stop accepting new connections
+immediately on cancellation while letting in-flight ones finish within the grace period, rather than
+today's cancellation, which races the whole `serve` future (including in-flight requests) and drops
+them the instant `cancel` flips.
 
 **Deliverable:** clean shutdown behavior under Kubernetes-style termination.
 

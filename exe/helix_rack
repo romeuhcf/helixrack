@@ -1,4 +1,31 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
+require "optparse"
+require "rack"
 require "helix_rack"
+
+# PRD.md section 6.2's Phase-2-relevant flags only (-a/-p/-b): --keep-alive-timeout,
+# --max-keepalive and --cpu-time-slice belong to Phase 4 and Phase 6 respectively and
+# are not implemented yet.
+options = {
+  app: "config.ru",
+  port: 8080,
+  bind: "0.0.0.0"
+}
+
+OptionParser.new do |parser|
+  parser.banner = "Usage: helix_rack [options]"
+  parser.on("-a", "--app PATH", "Path to the Rackup / Grape app (default: config.ru)") do |v|
+    options[:app] = v
+  end
+  parser.on("-p", "--port PORT", Integer, "TCP port to listen on (default: 8080)") do |v|
+    options[:port] = v
+  end
+  parser.on("-b", "--bind HOST", "Network interface IP to bind to (default: 0.0.0.0)") do |v|
+    options[:bind] = v
+  end
+end.parse!(ARGV)
+
+app = Rack::Builder.parse_file(options[:app])
+HelixRack.serve(app, options[:port], bind: options[:bind])
