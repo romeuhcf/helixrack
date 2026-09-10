@@ -18,7 +18,8 @@ as passing every gate: Phase 13's own benchmark fails its P99 latency threshold 
 `hello_world` and `io_mixed` scenarios (`cpu_bound` passes) -- a real, understood single-OS-thread
 queueing tradeoff, not a bug (see PLAN.md's Phase 13 Resolution note for the numbers and why). A
 post-Phase-13 fix (missing `TCP_NODELAY`) cut that gap sharply -- HelixRack now has the lowest
-absolute p99 of all three servers on every scenario -- without closing it enough to flip the Gate;
+absolute p99 of all three servers in both remeasured scenarios -- without closing it enough to flip
+the Gate;
 see PLAN.md's "Post-Phase-13 follow-up" note for the before/after numbers. See PLAN.md for each
 phase's own Resolution notes.
 
