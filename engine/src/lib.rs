@@ -78,6 +78,14 @@ impl ConnectionCounter {
 /// writes the serialized response (HTTP/1.1 keep-alive: the connection
 /// stays open for the next request unless the client closes it).
 ///
+/// `max_keepalive` and `keep_alive_timeout` implement `PLAN.md`'s Phase 4
+/// (see `connection::handle`'s doc comment for the exact semantics of
+/// each): the former bounds how many requests a single connection may be
+/// answered before the engine adds `Connection: close` to the final
+/// response and closes it; the latter bounds how long a connection may sit
+/// with no new request arriving before the engine closes it with no
+/// response (nothing to answer -- the client isn't mid-request).
+///
 /// Each accepted connection is handled in its own `tokio::task::spawn_local`
 /// task so one slow or idle connection doesn't block the accept loop from
 /// taking the next one -- this schedules concurrent tasks on the same OS
@@ -95,6 +103,8 @@ pub async fn serve(
     listener: TcpListener,
     connections: Arc<ConnectionCounter>,
     handler: Rc<dyn Handler>,
+    max_keepalive: usize,
+    keep_alive_timeout: Duration,
 ) -> io::Result<()> {
     loop {
         let (socket, _peer_addr) = match listener.accept().await {
@@ -110,7 +120,7 @@ pub async fn serve(
         tokio::task::spawn_local(async move {
             // A single connection's read/write error must not affect any
             // other connection or the accept loop, so it's swallowed here.
-            let _ = connection::handle(socket, handler).await;
+            let _ = connection::handle(socket, handler, max_keepalive, keep_alive_timeout).await;
         });
     }
 }

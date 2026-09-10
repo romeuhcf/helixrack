@@ -157,16 +157,34 @@ correctly.
 
 `--keep-alive-timeout`, `--max-keepalive` flags become functional.
 
+**Architecture note (the engine owns the `Connection` header, not the `Handler`):** `Connection` is
+a hop-by-hop HTTP header describing this specific TCP connection's lifecycle -- the Rack
+app/`Handler` has no business setting it, and HTTP/1.1 connections are persistent by default unless
+either side says otherwise (RFC 7230), so the engine only needs to *add* `Connection: close` when
+it is forcing one, never `Connection: keep-alive` on the normal path. `connection::handle` sets it
+on the response it's about to send right before serializing, after getting the `HandlerResponse`
+back from `Handler::call` -- not something `Handler`/`ext/helix_rack` needs to know about at all.
+
 **Deliverable:** idle-timeout close and max-requests-per-connection close.
 
 **Gate:**
 
-- Open a connection, send `max-keepalive` requests, assert response N+1 either gets `Connection:
-  close` or the socket is refused/closed — deterministic count-based assertion, no timing
+- Open one connection, send `max-keepalive` requests on it in sequence. The response to the
+  `max-keepalive`-th request must carry `Connection: close` (the server signals this is the last
+  one it will answer on this connection), and the server must close the connection right after
+  sending it — a `(max-keepalive + 1)`-th request attempted on the same (now-closed) connection
+  must find it refused/reset, not answered. Deterministic count-based assertion, no timing
   involved.
 - Idle timeout: set timeout to a small fixed value (e.g. 500 ms), open a connection, send
   nothing, assert the socket receives EOF within `[timeout, timeout + fixed epsilon]` measured by
-  a monotonic clock in the test — bounded-tolerance, still deterministic pass/fail.
+  a monotonic clock in the test — bounded-tolerance, still deterministic pass/fail. Applies only
+  to a genuinely idle connection (no bytes of a new request buffered yet). A client mid-request,
+  trickling header/body bytes slowly, is **not** covered by this timeout or fully covered by
+  anything else: Phase 1's `MAX_BUF_CAPACITY`/`MAX_BODY_CAPACITY` bound how much such a client can
+  make the connection *buffer*, not how long it can take to send it — a client sending one byte
+  then going silent trips neither cap. Confirmed as a real gap by this phase's safety review, left
+  open deliberately: PRD.md's `--keep-alive-timeout` is specified as bounding idle connections, not
+  slow ones, so this is its own future hardening item, not something to fold into this flag.
 
 ## Phase 5 — GVL release discipline (RF06)
 

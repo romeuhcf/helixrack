@@ -19,7 +19,12 @@ module HelixRack
   # same OS thread. The GVL is released while idle (see `_serve_native`'s
   # doc comment for why that's necessary even in this phase) and reacquired
   # only for each request's `app.call(env)`.
-  def self.serve(app, port, bind: "0.0.0.0")
-    _serve_native(app, port, bind)
+  #
+  # `keep_alive_timeout` and `max_keepalive` implement Phase 4's keep-alive
+  # lifecycle (see `PLAN.md`, Phase 4): PRD.md section 6.2's defaults (15
+  # seconds, 10000 requests) apply unless the caller (`exe/helix_rack`'s
+  # `--keep-alive-timeout`/`--max-keepalive` flags) overrides them.
+  def self.serve(app, port, bind: "0.0.0.0", keep_alive_timeout: 15, max_keepalive: 10_000)
+    _serve_native(app, port, bind, keep_alive_timeout, max_keepalive)
   end
 end

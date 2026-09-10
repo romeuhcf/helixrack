@@ -13,9 +13,19 @@
 //! bounded chunks (see [`write_body`]) instead of being read into memory
 //! whole. The status-line-and-headers front matter (see [`serialize_head`])
 //! doesn't change either way.
+//!
+//! Since Phase 4 (see `PLAN.md`, Phase 4), this module also owns the
+//! connection's keep-alive lifecycle: [`handle`] counts requests served
+//! against `max_keepalive`, adding `Connection: close` to (and closing the
+//! connection right after) the final one it will answer; and it applies
+//! `keep_alive_timeout` to the one read that's waiting for a brand-new
+//! request to start arriving on an otherwise-idle connection. See Phase 4's
+//! "Architecture note" for why the engine, not `Handler`, owns the
+//! `Connection` header on every response.
 
 use std::io;
 use std::rc::Rc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -75,13 +85,46 @@ const MAX_HEADERS: usize = 64;
 /// each one, and writes the serialized response, for as long as the client
 /// keeps the connection open (HTTP/1.1 keep-alive).
 ///
-/// Returns once the client closes the connection (EOF) or a read/write/
-/// parse error occurs. The caller (the `serve` accept loop) runs this per
-/// connection independently, so one connection's error doesn't affect
-/// others.
-pub(crate) async fn handle(mut socket: TcpStream, handler: Rc<dyn Handler>) -> io::Result<()> {
+/// `max_keepalive` bounds how many requests this connection will be
+/// answered: on the `max_keepalive`-th request's response, [`handle`] adds
+/// `Connection: close` (after stripping any `Connection` header `handler`
+/// itself set -- see this module's top doc comment and `PLAN.md`'s Phase 4
+/// "Architecture note") and returns right after writing it, without looping
+/// back to read another request. Every other response gets no `Connection`
+/// header at all -- HTTP/1.1 connections are persistent by default (RFC
+/// 7230), so there is nothing to say on the normal path.
+///
+/// `keep_alive_timeout` bounds how long this connection may sit idle -- no
+/// bytes of a new request buffered yet -- before [`handle`] closes it with
+/// no response (there is nothing to answer; the client isn't mid-request).
+/// It applies *only* to that specific bottom-of-loop read: a read that's
+/// continuing an already-in-progress request (partial headers already
+/// buffered, the `MAX_BUF_CAPACITY` growth path, or a mid-body read) is
+/// unaffected. Once a client has sent at least one byte of a new request,
+/// there is currently no time bound on how long it may then go silent --
+/// `MAX_BUF_CAPACITY`/`MAX_BODY_CAPACITY` only bound how much such a client
+/// can make this connection *buffer* before being rejected, not how long it
+/// can take to send it (a client that sends one byte and then nothing would
+/// never trip either cap). A real, acknowledged gap flagged by this phase's
+/// safety review, deliberately not fixed here: PRD.md's `--keep-alive-
+/// timeout` is specified as bounding *idle* connections, not slow ones, so
+/// closing that gap is scoped as its own future hardening item, not smuggled
+/// into this flag's meaning.
+///
+/// Returns once the client closes the connection (EOF), the connection is
+/// closed by this function (`max_keepalive` reached, or `keep_alive_timeout`
+/// elapsed on an idle read), or a read/write/parse error occurs. The caller
+/// (the `serve` accept loop) runs this per connection independently, so one
+/// connection's error doesn't affect others.
+pub(crate) async fn handle(
+    mut socket: TcpStream,
+    handler: Rc<dyn Handler>,
+    max_keepalive: usize,
+    keep_alive_timeout: Duration,
+) -> io::Result<()> {
     let mut buf = vec![0u8; INITIAL_BUF_CAPACITY];
     let mut filled = 0usize;
+    let mut requests_served = 0usize;
 
     loop {
         // Parse as many complete requests as are already buffered before
@@ -172,10 +215,54 @@ pub(crate) async fn handle(mut socket: TcpStream, handler: Rc<dyn Handler>) -> i
                 body: &buf[consumed..body_end],
             };
 
-            let response = handler.call(&parsed_request);
+            let mut response = handler.call(&parsed_request);
+
+            // The engine is the sole source of truth for the `Connection`
+            // header on every response, not `Handler` -- see this module's
+            // top doc comment and `PLAN.md`'s Phase 4 "Architecture note".
+            // Strip whatever `handler` set (case- *and* incidental-
+            // whitespace-insensitively -- a Rack app's header Hash reaches
+            // here with no trimming/normalization applied anywhere upstream,
+            // so a stray-whitespace key like `" Connection"` would otherwise
+            // survive this filter and land on the wire alongside the
+            // engine's own line below) before deciding, just below, whether
+            // *this* response is the one that gets `Connection: close`.
+            response
+                .headers
+                .retain(|(name, _)| !name.trim().eq_ignore_ascii_case("connection"));
+
+            // A response with a body but neither Content-Length nor
+            // Transfer-Encoding leaves the client with no way to know where
+            // the body ends -- harmless on the final (Connection: close)
+            // response, since EOF marks the end, but on every other one the
+            // client keeps waiting for more body bytes while this loop
+            // waits for the next request on the same socket: a hang, only
+            // ever broken by `keep_alive_timeout`. Found by this phase's
+            // code review, not by any existing gate (every fixture app used
+            // so far always set Content-Length itself).
+            ensure_framing(&mut response).await?;
+
+            requests_served += 1;
+            let is_last_allowed_request = requests_served >= max_keepalive;
+            if is_last_allowed_request {
+                response
+                    .headers
+                    .push(("Connection".to_string(), "close".to_string()));
+            }
+
             let head = serialize_head(&response);
             socket.write_all(&head).await?;
             write_body(&mut socket, &response.body).await?;
+
+            if is_last_allowed_request {
+                // This was the max_keepalive-th request: the response just
+                // sent already told the client this connection is closing
+                // (`Connection: close` above) -- close it now rather than
+                // looping back to read another request (or even processing
+                // any already-pipelined bytes after this one; the client was
+                // told not to expect more answers on this socket).
+                return Ok(());
+            }
 
             // Shift any bytes after this request (start of the next
             // pipelined request, if any) down to the front, without
@@ -205,7 +292,22 @@ pub(crate) async fn handle(mut socket: TcpStream, handler: Rc<dyn Handler>) -> i
             buf.resize(new_capacity, 0);
         }
 
-        let read = socket.read(&mut buf[filled..]).await?;
+        // `keep_alive_timeout` applies only here, and only when nothing of a
+        // new request has been buffered yet (`filled == 0`) -- a genuinely
+        // idle connection, not one mid-request. See `handle`'s doc comment.
+        let read = if filled == 0 {
+            match tokio::time::timeout(keep_alive_timeout, socket.read(&mut buf[filled..])).await
+            {
+                Ok(result) => result?,
+                Err(_elapsed) => {
+                    // Idle timeout: nothing to answer (the client isn't
+                    // mid-request), so just close.
+                    return Ok(());
+                }
+            }
+        } else {
+            socket.read(&mut buf[filled..]).await?
+        };
         if read == 0 {
             // EOF: the client closed the connection.
             return Ok(());
@@ -275,12 +377,52 @@ fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
+/// Ensures `response` has valid HTTP/1.1 message framing before
+/// [`serialize_head`]/[`write_body`] write it -- see the call site in
+/// [`handle`] for why a response with a body but neither `Content-Length`
+/// nor `Transfer-Encoding` is a real hang hazard on a persistent connection,
+/// not just a cosmetic gap.
+///
+/// Only ever injects `Content-Length`, never `Transfer-Encoding`/chunked --
+/// this engine doesn't speak chunked encoding (PRD.md's scope). Both
+/// `ResponseBody` variants always have a knowable exact length before any
+/// bytes are written, so this is always possible when framing is missing.
+/// Does *not* second-guess a `Content-Length` the handler already set (even
+/// if it were wrong) -- only fills the gap when neither header is present
+/// at all, consistent with "the handler is responsible for every header it
+/// sets" everywhere else in this module.
+async fn ensure_framing(response: &mut HandlerResponse) -> io::Result<()> {
+    let has_framing = response.headers.iter().any(|(name, _)| {
+        let name = name.trim();
+        name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("transfer-encoding")
+    });
+    if has_framing {
+        return Ok(());
+    }
+
+    let body_len: u64 = match &response.body {
+        ResponseBody::InMemory(bytes) => bytes.len() as u64,
+        ResponseBody::Spooled(file) => {
+            // A duplicated fd (same underlying file, own seek position --
+            // `write_body` relies on the same `try_clone` pattern), so
+            // reading its metadata doesn't disturb whatever position the
+            // original `File` is left at.
+            let duplicated = file.try_clone()?;
+            tokio::fs::File::from_std(duplicated).metadata().await?.len()
+        }
+    };
+    response
+        .headers
+        .push(("Content-Length".to_string(), body_len.to_string()));
+    Ok(())
+}
+
 /// Serializes a [`HandlerResponse`]'s front matter into real HTTP/1.1 bytes:
-/// a status line with a reason phrase, the given headers verbatim (no
-/// injected `Content-Length` or similar -- the handler is responsible for
-/// every header it wants sent), then a blank line. The body is a separate
-/// step ([`write_body`]) since, as of Phase 3, it isn't always already a
-/// byte slice sitting in memory to append here.
+/// a status line with a reason phrase, the given headers verbatim (by the
+/// time this runs, [`ensure_framing`] has already guaranteed valid framing
+/// -- this function itself injects nothing), then a blank line. The body is
+/// a separate step ([`write_body`]) since, as of Phase 3, it isn't always
+/// already a byte slice sitting in memory to append here.
 fn serialize_head(response: &HandlerResponse) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(128);
     bytes.extend_from_slice(
