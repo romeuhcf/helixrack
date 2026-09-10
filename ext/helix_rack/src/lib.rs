@@ -172,6 +172,493 @@ mod gvl {
     }
 }
 
+/// Phase 6 (`PLAN.md`, Phase 6): the watchdog OS thread and the
+/// counter-based preemption *signal* it drives via `rb_postponed_job_trigger`.
+///
+/// # Step 1 findings -- the API, verified, not assumed
+///
+/// PLAN.md's Phase 6 architecture note flags one load-bearing claim that
+/// needs verifying before any of this is trustworthy: that
+/// `rb_postponed_job_trigger` is genuinely safe to call from a different OS
+/// thread, without holding the GVL. Verified two ways, both pointing at the
+/// same answer:
+///
+/// 1. This project's own generated bindgen output (the same technique
+///    `ext/helix_rack/src/lib.rs`'s `gvl` module used in Phase 2 to find
+///    `rb_thread_call_without_gvl`'s real signature):
+///    `target/debug/build/rb-sys-*/out/bindings-0.9.130-mri-x86_64-linux-4.0.6.rs`
+///    (there are several `rb-sys-*` build dirs from different cargo
+///    profiles/feature sets; all carry the same bindings for this Ruby
+///    version) declares exactly four postponed-job functions:
+///    `rb_postponed_job_preregister`, `rb_postponed_job_trigger`, and the
+///    two deprecated ones below. `rb_postponed_job_trigger`'s doc comment
+///    there reads: "This method is async-signal-safe and can be called from
+///    any thread, at any time, including in signal handlers."
+/// 2. Cross-checked against this machine's actually-installed Ruby 4.0.6
+///    headers (`ruby -v` confirms 4.0.6, matching the bindgen filename
+///    exactly -- not a different Ruby than the one this extension builds
+///    against): `~/.local/share/mise/installs/ruby/4.0.6/include/ruby-4.0.0/
+///    ruby/debug.h`. Same declarations, same doc comment, word for word --
+///    bindgen's output is a direct transcription of this header, not a
+///    separate claim to independently doubt.
+///
+/// That header also explains *why* the modern `..._preregister`/
+/// `..._trigger` pair exists instead of the older, single-call
+/// `rb_postponed_job_register`/`rb_postponed_job_register_one` (still
+/// present, but `#[deprecated]` in the bindgen output): those older
+/// functions "claimed to be fully async-signal-safe... [but] were subject
+/// to race conditions which could cause crashes when racing with Ruby's
+/// internal use of them." This module uses only the current, non-deprecated
+/// pair.
+///
+/// # Does magnus wrap any of this?
+///
+/// No. Checked the same way Phase 2 checked for `rb_thread_call_without_gvl`
+/// -- magnus 0.8.2's own `src/lib.rs` "C Function Index" (`grep -rn
+/// "postponed_job" .../magnus-0.8.2/src/lib.rs`). It lists exactly two
+/// entries, both commented out (magnus's convention there for "known,
+/// deliberately unimplemented"): `rb_postponed_job_register` and
+/// `rb_postponed_job_register_one` -- the two *deprecated* functions. The
+/// current `rb_postponed_job_preregister`/`rb_postponed_job_trigger` pair
+/// isn't mentioned anywhere in that crate at all (`grep -rn
+/// "postponed_job_preregister\|postponed_job_trigger"` across the whole
+/// `magnus-0.8.2` source tree returns nothing) -- not implemented, not even
+/// on the "known unimplemented" list, presumably because that list predates
+/// the newer API. Either way: raw `rb-sys` FFI, same as `gvl`, is the only
+/// option.
+///
+/// # Step 3 -- the open question, investigated and answered "no, ship
+/// counter-only"
+///
+/// PLAN.md's Phase 6 section asks, as a genuinely open question: can the
+/// postponed job's callback -- invoked synchronously by Ruby's own bytecode
+/// dispatch, nested inside the still-in-progress `Handler::call`'s
+/// `gvl::with_gvl` scope, itself nested inside the outer
+/// `runtime.block_on(local_set.run_until(...))` call in `_serve_native` --
+/// safely drive Tokio's reactor forward to service *other* connections
+/// during that pause? Investigated empirically (a throwaway standalone
+/// crate, not theorized from memory): built a minimal `current_thread` +
+/// `LocalSet` runtime, spawned a second `spawn_local` task standing in for
+/// "another connection", and, from *inside* the first task's own poll (the
+/// direct analogue of being nested inside `Handler::call`), called
+/// `tokio::runtime::Handle::block_on` on a trivial future -- the most direct
+/// available way to "drive the runtime forward" from that nested position.
+/// It panicked immediately: `"Cannot start a runtime from within a runtime.
+/// This happens because a function (like `block_on`) attempted to block the
+/// current thread while the thread is being used to drive asynchronous
+/// tasks."` Tokio's `current_thread` runtime is not reentrant, and this is
+/// enforced, not merely discouraged.
+///
+/// There is also no lower-level, safe, *public* Tokio API to do a partial
+/// "just drive the reactor / wake ready tasks" step without going through
+/// `block_on` (no `Runtime::turn()`-style primitive exists in Tokio 1.x);
+/// reaching for private/internal mechanics to fake one would be exactly the
+/// kind of guess-implementation this phase's brief says not to ship. And
+/// even setting the reentrancy panic aside, the goal is arguably incoherent
+/// on its own terms: any *other* connection whose task is ready to run is,
+/// for an HTTP server whose only real work is calling `Handler::call`,
+/// indistinguishable from "ready to have its Rack app's `.call(env)`
+/// invoked" -- so "drain the reactor without risking a second nested call
+/// into Ruby" (PLAN.md's own stated constraint) would require the nested
+/// poll to selectively run only non-Ruby-touching tasks, which the
+/// scheduler's public API gives no way to do.
+///
+/// Conclusion: this phase ships the verified, correctly-firing counter-based
+/// trigger mechanism only. **The "actually unstarves the event loop"
+/// capability PRD.md's RF07 and PLAN.md's Phase 6 deliverable describe is
+/// NOT implemented** -- a long-running CPU-bound handler still fully
+/// occupies this server's one OS thread until it returns or yields the GVL
+/// on its own; all this phase adds is a correctly-firing signal that it
+/// happened, counted, and readable from Ruby via
+/// `HelixRack._postponed_job_count`. No later phase in `PLAN.md` revisits
+/// this gap -- see that document's Phase 6 section, updated alongside this
+/// module, for the same conclusion recorded where the next reader of the
+/// plan will see it.
+mod watchdog {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{Condvar, Mutex, OnceLock};
+    use std::thread::{self, JoinHandle};
+    use std::time::Instant;
+
+    /// How many times [`postponed_job_callback`] has actually run. Global,
+    /// not scoped to one `Watchdog`/`_serve_native` call:
+    /// `rb_postponed_job_preregister` is itself a one-time, process-lifetime
+    /// registration (see [`register`]), so there is exactly one callback for
+    /// the whole process, and `HelixRack._postponed_job_count` is a simple,
+    /// always-valid global getter regardless of whether a server is
+    /// currently running. This does **not** reset between `HelixRack.serve`
+    /// calls in the same process (e.g. across RSpec examples that each boot
+    /// and kill their own server) -- a caller that needs a fresh reading
+    /// must capture a baseline before its request and assert on the delta,
+    /// which is exactly what `spec/integration/phase6_preemption_spec.rb`
+    /// does, rather than assuming this starts at zero.
+    static POSTPONED_JOB_COUNT: AtomicU64 = AtomicU64::new(0);
+
+    /// The handle returned by `rb_postponed_job_preregister`, set exactly
+    /// once by [`register`].
+    static POSTPONED_JOB_HANDLE: OnceLock<rb_sys::rb_postponed_job_handle_t> = OnceLock::new();
+
+    /// The callback Ruby invokes -- on whatever Ruby thread next checks for
+    /// interrupts, always holding the GVL at that point (per
+    /// `rb_postponed_job_trigger`'s doc comment, verified above) -- once
+    /// [`fire`] has called `rb_postponed_job_trigger`. Deliberately the
+    /// simplest possible thing: increments [`POSTPONED_JOB_COUNT`] and
+    /// returns. Touches no Ruby object and calls no Ruby/magnus API, even
+    /// though the GVL is held here and the doc comment says allocation would
+    /// be safe -- this phase's gate needs nothing more than a count, and the
+    /// smaller the surface of an `extern "C"` callback Ruby can invoke at an
+    /// arbitrary bytecode dispatch point, the easier it is to be sure it's
+    /// correct.
+    ///
+    /// # Safety
+    /// Called by Ruby itself (via the postponed job mechanism), always
+    /// holding the GVL when it does -- never called directly by this crate.
+    unsafe extern "C" fn postponed_job_callback(_data: *mut c_void) {
+        POSTPONED_JOB_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Registers [`postponed_job_callback`] in Ruby's postponed job table,
+    /// storing the returned handle in [`POSTPONED_JOB_HANDLE`]. Called
+    /// exactly once, from `init` (this extension's `#[magnus::init]` entry
+    /// point -- i.e. while Ruby is loading the native extension, holding the
+    /// GVL): `rb_postponed_job_preregister`'s own doc comment (see this
+    /// module's top doc comment) says "Generally, this function will be
+    /// called during the initialization routine of an extension", and the
+    /// table it registers into is small (32 entries) and process-lifetime --
+    /// registering more than once would either grow the table pointlessly or
+    /// (same doc comment) silently overwrite the stored `data` for an
+    /// existing registration of the same `func` and hand back the same
+    /// handle anyway, since `postponed_job_callback` is the same function
+    /// pointer every time. `_serve_native` (unlike this) *does* run once per
+    /// server start, potentially many times per process across tests --
+    /// which is exactly why registration lives here, in `init`, and not
+    /// there.
+    /// `rb_postponed_job_preregister`'s documented failure sentinel: the
+    /// 32-entry preregistration table is full (e.g. many other extensions
+    /// already registered their own jobs). A `#define` macro in Ruby's own
+    /// `ruby/debug.h`
+    /// (`#define POSTPONED_JOB_HANDLE_INVALID ((rb_postponed_job_handle_t)UINT_MAX)`,
+    /// verified by reading the installed Ruby 4.0.6 header directly), not a
+    /// constant `bindgen` translated into these bindings -- hardcoded here
+    /// with that source cited, not guessed.
+    const POSTPONED_JOB_HANDLE_INVALID: rb_sys::rb_postponed_job_handle_t = u32::MAX;
+
+    fn register() {
+        // SAFETY: `rb_postponed_job_preregister` requires no GVL-related
+        // precondition beyond "generally called from an extension's init
+        // routine" (see the doc comment quoted above) -- `init` satisfies
+        // that directly. `postponed_job_callback` matches
+        // `rb_postponed_job_func_t` exactly (`extern "C" fn(*mut c_void)`),
+        // and `data` is unused (passed as `null_mut`) since the callback
+        // needs none.
+        let handle = unsafe {
+            rb_sys::rb_postponed_job_preregister(0, Some(postponed_job_callback), std::ptr::null_mut())
+        };
+        // A safety-review finding: the old version of this function stored
+        // whatever came back unconditionally. If the table were ever full
+        // (unlikely with only 32 slots and few extensions loaded, but
+        // documented and real), this would silently store an invalid handle
+        // that `fire` would trigger on every over-slice request thereafter.
+        // Ruby's own docs are explicit this failure is permanent for the
+        // process's lifetime ("no further registration will do so"), so
+        // there is nothing to retry -- failing loudly at extension-load time
+        // is the right response, not a silent no-op preemption feature.
+        assert_ne!(
+            handle, POSTPONED_JOB_HANDLE_INVALID,
+            "rb_postponed_job_preregister's table is full -- HelixRack's Phase 6 preemption \
+             signal cannot function for the rest of this process"
+        );
+        // `.set` only fails if already set -- `register` has exactly one
+        // caller (`init`, invoked once per process by Ruby's extension
+        // loader), so this can't race in practice; `expect` documents that
+        // invariant rather than silently ignoring a violation of it.
+        POSTPONED_JOB_HANDLE
+            .set(handle)
+            .expect("watchdog::register must only be called once, from init");
+    }
+
+    /// Calls `rb_postponed_job_trigger` for the handle [`register`] stored.
+    /// Safe to call from any thread without holding the GVL -- see this
+    /// module's top doc comment for the verification. This is the only
+    /// place in this module that actually touches the Ruby C-API from
+    /// [`Watchdog`]'s own OS thread.
+    fn fire() {
+        let handle = *POSTPONED_JOB_HANDLE
+            .get()
+            .expect("watchdog::register must run (from init) before any Watchdog can fire");
+        // SAFETY: `rb_postponed_job_trigger` is documented async-signal-safe
+        // and callable from any thread at any time without the GVL (see
+        // this module's top doc comment) -- the one precondition is that
+        // `handle` came from a still-valid `rb_postponed_job_preregister`
+        // call, which it did (`register`, at extension-init time, and the
+        // registration table lives for the process's entire lifetime).
+        unsafe { rb_sys::rb_postponed_job_trigger(handle) };
+    }
+
+    /// Current value of [`POSTPONED_JOB_COUNT`] -- backs
+    /// `HelixRack._postponed_job_count`.
+    pub(super) fn postponed_job_count() -> u64 {
+        POSTPONED_JOB_COUNT.load(Ordering::SeqCst)
+    }
+
+    /// Registers the postponed job callback -- see [`register`]'s doc
+    /// comment for why this must run exactly once, from `init`.
+    pub(super) fn init() {
+        register();
+    }
+
+    /// One request's deadline state, guarded by [`Watchdog`]'s `Mutex` --
+    /// see that struct's doc comment for the full synchronization design.
+    /// `generation` is bumped on every [`Watchdog::arm`]/[`Watchdog::disarm`]
+    /// transition so the watchdog thread can tell, after firing and
+    /// reacquiring the lock, whether the armed period it just fired for is
+    /// still the current one (see [`Watchdog::run`]) -- comparing `Instant`
+    /// deadlines directly would work in practice (two real deadlines
+    /// colliding to the nanosecond is not realistic) but a plain counter
+    /// removes any doubt rather than relying on that.
+    enum State {
+        /// No request is currently in flight; the watchdog thread blocks
+        /// indefinitely (see [`Watchdog::run`]) until [`Watchdog::arm`] or
+        /// [`Watchdog::shutdown`] changes this.
+        Idle,
+        /// A request is in flight; the watchdog thread wakes at `Instant`
+        /// (or sooner, if the state changes first) to check whether it's
+        /// still due.
+        Armed(Instant),
+        /// `_serve_native` is returning; the watchdog thread exits its loop.
+        Shutdown,
+    }
+
+    /// The Phase 6 watchdog: a dedicated OS thread (see `PLAN.md`'s Phase 6
+    /// "Architecture note" for why a second OS thread is unavoidable here --
+    /// the main thread has handed control to Ruby's VM synchronously for the
+    /// duration of `Handler::call` and cannot notice a long-running one on
+    /// its own) that tracks one request's deadline at a time and calls
+    /// [`fire`] if that deadline passes while the request is still in
+    /// flight.
+    ///
+    /// # Synchronization design
+    ///
+    /// A `Mutex<(State, u64)>` + `Condvar`, not raw atomics: this state
+    /// changes at most a few times per request (arm, disarm, occasionally a
+    /// fire) plus once at shutdown, so lock/unlock overhead (tens of
+    /// nanoseconds) is immaterial next to the cost of a Ruby request, and a
+    /// mutex makes the one genuinely subtle race here -- "a request finishes
+    /// just as the watchdog is about to fire" -- trivial to reason about:
+    /// [`Watchdog::disarm`] and the watchdog thread's own deadline check
+    /// both take the same lock, so they can never interleave; either
+    /// `disarm` runs first (sets `Idle`, the watchdog thread's `now >=
+    /// deadline` check never even sees `Armed` again) or the watchdog
+    /// thread's check runs first (while still holding the lock, sees
+    /// `Armed(deadline)` with `deadline` already passed, and proceeds to
+    /// fire) and `disarm` simply blocks on the mutex until the watchdog
+    /// thread releases it after firing. Either outcome is correct: a fire
+    /// that loses this race by a hair is a harmless extra
+    /// `rb_postponed_job_trigger` call whose callback just increments a
+    /// counter (see [`postponed_job_callback`]) -- there is no "un-fire"
+    /// needed, and the gate's fast-handler fixture leaves enough margin
+    /// under the slice that this race is never actually live for it (see
+    /// `spec/integration/phase6_preemption_spec.rb`).
+    ///
+    /// No busy-spinning: idle waits block indefinitely on the `Condvar`
+    /// (zero wakeups between requests); an armed wait uses
+    /// `Condvar::wait_timeout` bounded to exactly the remaining slice, so
+    /// the OS -- not this thread -- accounts for the wait, and the thread
+    /// wakes at most twice per over-slice request (once at the deadline to
+    /// fire, once more at `disarm`) and exactly once per under-slice request
+    /// (at `disarm`, well before its `wait_timeout` would have elapsed).
+    pub(super) struct Watchdog {
+        /// `(state, generation)` -- see [`State`]'s doc comment for why
+        /// `generation` is tracked alongside it.
+        state: Mutex<(State, u64)>,
+        cv: Condvar,
+    }
+
+    impl Watchdog {
+        /// Spawns the watchdog thread and returns the shared handle plus a
+        /// [`WatchdogGuard`] that shuts it down and joins it when dropped --
+        /// see that type's doc comment for why RAII, not a manual
+        /// shutdown-then-join call `_serve_native` is trusted to remember on
+        /// every exit path.
+        pub(super) fn spawn() -> (Arc<Self>, WatchdogGuard) {
+            let watchdog = Arc::new(Self {
+                state: Mutex::new((State::Idle, 0)),
+                cv: Condvar::new(),
+            });
+            let thread_watchdog = Arc::clone(&watchdog);
+            let join_handle = thread::Builder::new()
+                .name("helix_rack-watchdog".to_string())
+                .spawn(move || thread_watchdog.run())
+                .expect("failed to spawn the HelixRack Phase 6 watchdog thread");
+            let guard = WatchdogGuard {
+                watchdog: Arc::clone(&watchdog),
+                thread: Some(join_handle),
+            };
+            (watchdog, guard)
+        }
+
+        /// Arms the watchdog for one request: due `slice` from now. Every
+        /// call bumps `generation` (see [`State`]'s doc comment). Must be
+        /// paired with [`Watchdog::disarm`] once the request finishes --
+        /// [`ArmedGuard`] (returned by [`Watchdog::arm_guard`]) does this via
+        /// `Drop` so a caller can't forget, even on an early return.
+        fn arm(&self, slice: Duration) {
+            let deadline = Instant::now() + slice;
+            let mut state = self.state.lock().unwrap();
+            state.0 = State::Armed(deadline);
+            state.1 += 1;
+            drop(state);
+            self.cv.notify_one();
+        }
+
+        /// Ends the current request's armed period. A no-op (state simply
+        /// goes to `Idle` either way) past the point the watchdog has
+        /// already fired for this request.
+        fn disarm(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.0 = State::Idle;
+            state.1 += 1;
+            drop(state);
+            self.cv.notify_one();
+        }
+
+        /// Arms for `slice` and returns an RAII guard that disarms on drop
+        /// -- the only way `RackAppHandler::call` touches the watchdog, so
+        /// arm/disarm can never desync even if `self.handle` returns early.
+        pub(super) fn arm_guard(&self, slice: Duration) -> ArmedGuard<'_> {
+            self.arm(slice);
+            ArmedGuard { watchdog: self }
+        }
+
+        /// Tells the watchdog thread to exit its loop, and wakes it
+        /// immediately (rather than waiting for whatever it's currently
+        /// blocked on) so `_serve_native` can join it without delay.
+        pub(super) fn shutdown(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.0 = State::Shutdown;
+            drop(state);
+            self.cv.notify_one();
+        }
+
+        /// The watchdog thread's body -- see this struct's doc comment for
+        /// the synchronization design this implements.
+        fn run(&self) {
+            // SAFETY (not memory-safety, just an invariant worth stating):
+            // `.unwrap()` on this lock's `LockResult` would only fail if a
+            // prior holder panicked while holding it -- nothing in `arm`,
+            // `disarm`, `shutdown`, or this loop body panics while the lock
+            // is held, so poisoning here would itself indicate a bug
+            // elsewhere in this module worth crashing loudly on, not a case
+            // to recover from silently.
+            let mut guard = self.state.lock().unwrap();
+            loop {
+                match guard.0 {
+                    State::Shutdown => return,
+                    State::Idle => {
+                        guard = self.cv.wait(guard).unwrap();
+                    }
+                    State::Armed(deadline) => {
+                        let now = Instant::now();
+                        if now < deadline {
+                            let (new_guard, _timeout_result) =
+                                self.cv.wait_timeout(guard, deadline - now).unwrap();
+                            guard = new_guard;
+                            continue;
+                        }
+                        // Deadline passed while still armed -- see this
+                        // struct's doc comment for why it's correct to fire
+                        // here rather than re-check against `disarm`'s
+                        // concurrent write: the lock already serializes
+                        // that.
+                        let fired_generation = guard.1;
+                        drop(guard);
+                        fire();
+                        guard = self.state.lock().unwrap();
+                        // Only block again if nothing has changed since the
+                        // fire (same generation still `Armed`) -- otherwise
+                        // loop back to the top and let the normal match
+                        // handle whatever the new state actually is
+                        // (`Idle` from a `disarm`, or a fresh `Armed` from
+                        // the next request already having started). Without
+                        // this check, an armed period that outlives one
+                        // slice would busy-loop calling `fire` every
+                        // iteration until `disarm` finally runs.
+                        //
+                        // Looped, not a single `wait`: a safety-review
+                        // finding caught that `Condvar::wait` can return on
+                        // a spurious wakeup with nothing having actually
+                        // changed (documented standard library behavior,
+                        // not specific to this code) -- a single `wait` call
+                        // would then fall through with `guard.0` still
+                        // `Armed(deadline)` at the same already-passed
+                        // deadline, and the outer `match` would take the
+                        // "deadline passed" branch again, firing a second
+                        // time for a request that hasn't finished. Re-
+                        // checking the generation after every wakeup, spurious
+                        // or not, and only stopping once it has genuinely
+                        // changed, fixes that without reintroducing the
+                        // busy-loop this check exists to prevent.
+                        while guard.1 == fired_generation {
+                            guard = self.cv.wait(guard).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// RAII guard returned by [`Watchdog::arm_guard`]: disarms the watchdog
+    /// when dropped.
+    pub(super) struct ArmedGuard<'a> {
+        watchdog: &'a Watchdog,
+    }
+
+    impl Drop for ArmedGuard<'_> {
+        fn drop(&mut self) {
+            self.watchdog.disarm();
+        }
+    }
+
+    /// RAII guard returned by [`Watchdog::spawn`]: on drop, shuts down the
+    /// watchdog and joins its thread.
+    ///
+    /// A safety-review finding on an earlier version of this module: with a
+    /// manual `watchdog.shutdown(); watchdog_thread.join();` call instead of
+    /// this guard, a *genuine* Rust-level early return in `_serve_native`
+    /// between spawning the watchdog and reaching that manual call (e.g. the
+    /// Tokio runtime's `.build()?` failing for an ordinary reason, unrelated
+    /// to Ruby) would leave the watchdog thread parked forever with nothing
+    /// left holding a reference able to shut it down. `Drop` runs on every
+    /// such early return automatically.
+    ///
+    /// This does **not** cover every early-return path, though, and it's
+    /// worth being precise about which: a `Thread#kill` pending against the
+    /// calling Ruby thread can be delivered via a non-local, longjmp-like
+    /// exit (see `_serve_native`'s own doc comment on `RackAppHandler::
+    /// prepare_app`'s placement for the full story, including a residual,
+    /// unresolved gap this ordering narrows but does not close) that does
+    /// *not* run Rust's normal unwind/`Drop` machinery -- this guard's
+    /// `Drop` is exactly as blind to that exit as a manual call would have
+    /// been. `_serve_native` still `drop`s this explicitly at one specific
+    /// point on the normal path (inside the `gvl::without_gvl` closure,
+    /// before it returns), because that placement, not RAII, is what
+    /// actually closes that particular window.
+    pub(super) struct WatchdogGuard {
+        watchdog: Arc<Watchdog>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl Drop for WatchdogGuard {
+        fn drop(&mut self) {
+            self.watchdog.shutdown();
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
 /// A [`Handler`] backed by a loaded Ruby Rack app (anything responding to
 /// `#call(env)`), built once per `_serve_native` call and shared (via `Rc`,
 /// see `PLAN.md`'s Phase 2 "Architecture note") across every connection's
@@ -195,19 +682,47 @@ struct RackAppHandler {
     /// `SERVER_PORT`'s value, precomputed once as a string rather than on
     /// every request.
     port: String,
+    /// Phase 6 (`PLAN.md`, Phase 6): the watchdog that fires a postponed job
+    /// if a single `call` (below) runs past `cpu_time_slice`. Shared (not
+    /// owned) because `_serve_native` spawns exactly one `watchdog::Watchdog`
+    /// per server run and must retain its own handle to shut it down and
+    /// join its thread once `serve` returns -- see `_serve_native`'s doc
+    /// comment.
+    watchdog: Arc<watchdog::Watchdog>,
+    /// PRD.md section 6.2's `--cpu-time-slice` (`exe/helix_rack` ->
+    /// `lib/helix_rack.rb` -> `_serve_native`), converted to a `Duration`
+    /// once here rather than on every request.
+    cpu_time_slice: Duration,
 }
 
 impl RackAppHandler {
-    fn new(ruby: &Ruby, app: Value, port: u16) -> Result<Self, Error> {
+    /// Does every Ruby/magnus-API call `RackAppHandler` needs before it can
+    /// be constructed (`app`'s GC root, `StringIO` loaded) -- split out from
+    /// `new` (which does no Ruby calls at all now, just struct
+    /// construction) so `_serve_native` can call this *before*
+    /// `watchdog::Watchdog::spawn`, not after. That ordering matters: see
+    /// `_serve_native`'s doc comment on the watchdog-thread-leak safety-
+    /// review finding this fixes.
+    fn prepare_app(ruby: &Ruby, app: Value) -> Result<(), Error> {
         gc::register_mark_object(app);
         // `StringIO` (used to build `rack.input`, see `call` below) is a
         // stdlib class, not always already loaded -- `require` is a no-op
         // (and cheap) if something else already pulled it in.
         ruby.require("stringio")?;
-        Ok(Self {
+        Ok(())
+    }
+
+    /// Constructs the handler. Does **not** call into Ruby/magnus at all --
+    /// [`RackAppHandler::prepare_app`] must have already run for `app`
+    /// (`_serve_native` is this type's only caller, and does exactly that,
+    /// in that order).
+    fn new(app: Value, port: u16, watchdog: Arc<watchdog::Watchdog>, cpu_time_slice: Duration) -> Self {
+        Self {
             app: Opaque::from(app),
             port: port.to_string(),
-        })
+            watchdog,
+            cpu_time_slice,
+        }
     }
 
     /// Builds the Rack `env` Hash for one parsed request, per PRD.md RF02
@@ -298,6 +813,17 @@ impl Handler for RackAppHandler {
         // `_serve_native`'s run, see this module's top doc comment) for the
         // synchronous duration of this one request's Ruby call.
         gvl::with_gvl(|| {
+            // Phase 6 (`PLAN.md`, Phase 6; see the `watchdog` module's top
+            // doc comment): armed for exactly the span of `self.handle`
+            // below, disarmed automatically (even on early return) when
+            // `_armed` drops at the end of this closure. If `self.handle`
+            // runs past `cpu_time_slice` while still armed, the watchdog
+            // thread fires a postponed job that increments a counter
+            // readable via `HelixRack._postponed_job_count` -- see that
+            // module's doc comment for why this phase ships only that
+            // counted *signal*, not an "actually unstarves the event loop"
+            // capability.
+            let _armed = self.watchdog.arm_guard(self.cpu_time_slice);
             self.handle(req).unwrap_or_else(|_err| HandlerResponse {
                 status: 500,
                 headers: Vec::new(),
@@ -502,16 +1028,28 @@ fn read_body(ruby: &Ruby, body: Value) -> Result<ResponseBody, Error> {
 }
 
 /// `HelixRack._serve_native(app, port, bind, keep_alive_timeout,
-/// max_keepalive)` (see `lib/helix_rack.rb`): binds a TCP listener on
-/// `bind`:`port` and runs `engine::serve` to completion, blocking the
-/// calling (Ruby-owning) thread for as long as it runs -- see this module's
-/// top doc comment for why that's correct for this phase.
+/// max_keepalive, cpu_time_slice_ms)` (see `lib/helix_rack.rb`): binds a TCP
+/// listener on `bind`:`port` and runs `engine::serve` to completion,
+/// blocking the calling (Ruby-owning) thread for as long as it runs -- see
+/// this module's top doc comment for why that's correct for this phase.
 ///
 /// `keep_alive_timeout_seconds` and `max_keepalive` implement `PLAN.md`'s
 /// Phase 4 (PRD.md section 6.2's `--keep-alive-timeout`/`--max-keepalive`
 /// CLI flags, threaded here from `exe/helix_rack` via `lib/helix_rack.rb`) --
 /// see `engine::serve`/`connection::handle`'s doc comments for their exact
 /// semantics; this function only converts and forwards them.
+///
+/// `cpu_time_slice_ms` implements `PLAN.md`'s Phase 6 (PRD.md section 6.2's
+/// `--cpu-time-slice`, threaded the same way): a `watchdog::Watchdog` is
+/// spawned here, once per call, for `RackAppHandler` to arm/disarm around
+/// each request (see `watchdog`'s and `RackAppHandler::call`'s doc
+/// comments), and is always shut down and joined before this function
+/// returns -- on every path, including an error from `listener.bind`/`serve`
+/// -- so no watchdog thread outlives the `_serve_native` call that spawned
+/// it (this matters more than usual for a background thread in this
+/// codebase: `spec/support/phase6_server_helper.rb`'s test harness boots and
+/// kills many short-lived servers in the same RSpec process, and a leaked
+/// watchdog thread per example would accumulate for the rest of the run).
 fn _serve_native(
     ruby: &Ruby,
     app: Value,
@@ -519,6 +1057,7 @@ fn _serve_native(
     bind: String,
     keep_alive_timeout_seconds: i64,
     max_keepalive: i64,
+    cpu_time_slice_ms: i64,
 ) -> Result<(), Error> {
     let port = u16::try_from(port).map_err(|_| {
         Error::new(
@@ -553,8 +1092,56 @@ fn _serve_native(
         ));
     }
     let keep_alive_timeout = Duration::from_secs(keep_alive_timeout_seconds);
+    let cpu_time_slice_ms = u64::try_from(cpu_time_slice_ms).map_err(|_| {
+        Error::new(
+            ruby.exception_arg_error(),
+            format!("cpu_time_slice {cpu_time_slice_ms} must not be negative"),
+        )
+    })?;
+    let cpu_time_slice = Duration::from_millis(cpu_time_slice_ms);
 
-    let handler: Rc<dyn Handler> = Rc::new(RackAppHandler::new(ruby, app, port)?);
+    // Every Ruby/magnus-API call this function needs happens *before*
+    // `watchdog::Watchdog::spawn` below, not after -- see that call's own
+    // comment for why. `RackAppHandler::new` itself (right after) makes
+    // none at all.
+    RackAppHandler::prepare_app(ruby, app)?;
+
+    // A safety-review finding: a `Thread#kill` pending against this calling
+    // Ruby thread can be delivered at essentially any call back into Ruby's
+    // VM (any magnus/`ruby.*` call), via the same non-local-exit mechanism
+    // documented in detail on the `gvl::without_gvl` call far below (a
+    // longjmp-like exit that does not run Rust's normal unwind/`Drop`
+    // machinery) -- not only at the one specific checkpoint that call's
+    // comment documents. Reproduced independently: a boot/kill loop with
+    // `RackAppHandler::new`'s old `ruby.require("stringio")?` still placed
+    // *after* `Watchdog::spawn` leaked a watchdog thread as early as the
+    // second iteration -- well before ever reaching `without_gvl`, so
+    // `WatchdogGuard`'s `Drop` (see its doc comment) doesn't help there
+    // either, since the same non-Rust-unwinding exit skips it too. Moving
+    // the only Ruby/magnus call in this stretch before `Watchdog::spawn`
+    // (so there's no Ruby call, and so no checkpoint, between spawning the
+    // watchdog and reaching `without_gvl`) measurably shrank the window --
+    // re-tested the same way, 1 leak in 20 boot/kill iterations, down from
+    // roughly 1 in 2 before this reordering -- but did **not** eliminate
+    // it: something can still deliver a kill signal into this stretch of
+    // plain Rust/OS code with no Ruby call in it at all, which this
+    // investigation did not fully root-cause (a plausible but unconfirmed
+    // candidate: MRI's own timer-thread-driven async interrupt checks,
+    // which may not be gated on an active C-API call the way VM bytecode-
+    // dispatch checkpoints are). Left as a known, rare, low-severity residual
+    // gap rather than silently claimed as fixed: one idle watchdog thread
+    // leaking on an unlucky `Thread#kill` timing during server *startup*
+    // specifically (not steady-state operation) is a one-time, bounded cost
+    // per occurrence, not an unbounded leak -- but it is real, and worth a
+    // second look before this mechanism is trusted for, e.g., a supervisor
+    // that boots/kills HelixRack servers in a tight loop.
+    let (watchdog, watchdog_guard) = watchdog::Watchdog::spawn();
+    let handler: Rc<dyn Handler> = Rc::new(RackAppHandler::new(
+        app,
+        port,
+        Arc::clone(&watchdog),
+        cpu_time_slice,
+    ));
     let connections = Arc::new(ConnectionCounter::new());
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -574,15 +1161,57 @@ fn _serve_native(
     // itself never returns on its own (Phase 8 -- graceful shutdown -- is
     // what teaches it to), so it's raced against `cancelled`, which resolves
     // once `without_gvl`'s unblock function has fired (see `gvl::without_gvl`).
+    //
+    // `watchdog_guard` is dropped *explicitly, inside* this closure, right
+    // after `block_on` returns and before the closure itself returns --
+    // not left to run "whenever its scope naturally ends" (which, for a
+    // value moved into this closure, would be right here anyway on the
+    // normal path, but the explicit `drop` documents that the timing is
+    // load-bearing, not incidental). Verified empirically that placement
+    // matters, the hard way: an earlier version of this function (before
+    // `WatchdogGuard` existed, with a manual `shutdown`/`join` call) put
+    // that call after `gvl::without_gvl` returned instead of inside its
+    // closure, and a throwaway same-process script that booted and
+    // `Thread#kill`ed a server in a loop (the same pattern `spec/support/
+    // phase6_server_helper.rb`'s `ensure` block uses) showed one extra
+    // `helix_rack-watchdog` OS thread left behind per iteration
+    // (`/proc/self/task`, thread names via `/proc/self/task/<tid>/comm`) --
+    // every one of them still alive, never cleaned up. Root cause:
+    // `rb_thread_call_without_gvl` (inside `gvl::without_gvl`) reacquires
+    // the GVL before it returns to its Rust caller, and GVL reacquisition is
+    // itself one of Ruby's interrupt-checkpoints -- if the calling thread
+    // has a pending `Thread#kill` at that point, Ruby delivers it there via
+    // a non-local exit (not normal Rust unwinding, and not something
+    // `WatchdogGuard`'s `Drop` would run for either -- a non-local exit does
+    // not unwind the Rust stack the way a panic does), which skips every
+    // remaining Rust statement in this function, including the watchdog
+    // cleanup that used to sit right after this call. This was already true
+    // of Phase 2/5's implementation (the only code after `without_gvl` was a
+    // trivial `result.map_err`, nobody could observe it being skipped), and
+    // would have been just as true of this closure's own `runtime.block_on`
+    // line had it not been reached before that GVL-reacquire step --
+    // confirmed with `eprintln!` tracing that `block_on` reliably returns
+    // (the boundary this closure runs inside is not itself skippable), only
+    // code placed *after* the whole `without_gvl` call is at risk. Nothing
+    // about shutting down/joining an OS thread needs the GVL, so running it
+    // here, still inside the GVL-released region, is both correct and the
+    // fix -- `WatchdogGuard` additionally covers every *other* early-return
+    // path out of this function (a fallible step between `Watchdog::spawn`
+    // and reaching this closure) automatically, which a manual call here
+    // never could; see that type's doc comment.
     let local_set = tokio::task::LocalSet::new();
     let result: std::io::Result<()> = gvl::without_gvl(|cancel| {
-        runtime.block_on(local_set.run_until(async move {
+        let result = runtime.block_on(local_set.run_until(async move {
             let listener = tokio::net::TcpListener::bind((bind.as_str(), port)).await?;
             tokio::select! {
                 res = serve(listener, connections, handler, max_keepalive, keep_alive_timeout) => res,
                 () = cancelled(cancel) => Ok(()),
             }
-        }))
+        }));
+
+        drop(watchdog_guard);
+
+        result
     });
 
     result.map_err(|e| Error::new(ruby.exception_runtime_error(), e.to_string()))
@@ -602,7 +1231,15 @@ async fn cancelled(cancel: &AtomicBool) {
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
     let module = ruby.define_module("HelixRack")?;
-    module.define_module_function("_serve_native", magnus::function!(_serve_native, 5))?;
+    module.define_module_function("_serve_native", magnus::function!(_serve_native, 6))?;
+    module.define_module_function(
+        "_postponed_job_count",
+        magnus::function!(watchdog::postponed_job_count, 0),
+    )?;
+    // Phase 6 (`PLAN.md`, Phase 6): pre-registers the postponed job callback
+    // exactly once, at extension load time -- see `watchdog::register`'s doc
+    // comment for why it belongs here rather than in `_serve_native`.
+    watchdog::init();
     Ok(())
 }
 

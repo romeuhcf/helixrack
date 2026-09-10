@@ -272,6 +272,60 @@ for a fixed, deterministic number of VM instructions past the slice threshold �
 0. Run one that finishes under the threshold → assert counter == 0. Counter-based, not
 latency-based.
 
+**Resolution (Step 1 verified; the open question investigated and answered "counter only" — see
+`ext/helix_rack/src/lib.rs`'s `watchdog` module doc comment for the full detail behind both):**
+
+- The API: `rb_postponed_job_trigger`'s "callable from any thread... without the GVL" claim is
+  confirmed, not assumed — verified two ways: this project's own generated bindgen output
+  (`target/debug/build/rb-sys-*/out/bindings-0.9.130-mri-x86_64-linux-4.0.6.rs`) and this machine's
+  actually-installed Ruby 4.0.6 header (`ruby/debug.h`), word-for-word identical doc comments on
+  both. Uses the current, non-deprecated `rb_postponed_job_preregister`/`rb_postponed_job_trigger`
+  pair, not the older `rb_postponed_job_register`/`_register_one` (that header itself documents
+  those as deprecated for real race conditions). magnus 0.8.2 wraps neither pair — confirmed by
+  grepping its own "C Function Index" and its full source tree — so this module calls raw `rb-sys`
+  FFI directly, same as the `gvl` module.
+- The open question: investigated empirically (a throwaway standalone Tokio `current_thread` +
+  `LocalSet` crate, not reasoned from memory) whether a postponed job's callback, nested inside the
+  still-in-progress `Handler::call`, could safely drive the runtime forward for other connections.
+  A nested `Handle::block_on` from inside an already-executing task's poll panicked immediately with
+  Tokio's own "Cannot start a runtime from within a runtime" reentrancy guard, and no safe, public,
+  lower-level Tokio API exists to do a partial "just drive the reactor" step instead. **Answer: no —
+  this capability is NOT implemented.** This phase ships only the verified, correctly-firing
+  counter-based trigger signal (`HelixRack._postponed_job_count`). A long-running CPU-bound handler
+  still fully occupies this server's one OS thread until it returns or yields the GVL on its own;
+  nothing in this codebase drains other connections' I/O during that pause. No later phase in this
+  plan revisits this gap.
+- The watchdog itself: a `Mutex`+`Condvar`-guarded deadline, armed/disarmed by `RackAppHandler::call`
+  around each `Handler::call` via an RAII guard, spawned once per `_serve_native` call and shut
+  down+joined before that call returns — including the `Thread#kill` path a background-`Thread`
+  test harness uses (`spec/support/phase6_server_helper.rb`, matching Phase 2/5's precedent).
+  That last part needed its own fix during implementation, worth recording: an earlier version put
+  the shutdown/join *after* the `gvl::without_gvl` call returned, which looked correct but leaked
+  one watchdog OS thread per `Thread#kill`'d server (confirmed via `/proc/self/task` thread-name
+  inspection across repeated boot/kill cycles) — `rb_thread_call_without_gvl` reacquires the GVL
+  before returning to its Rust caller, and GVL reacquisition is itself one of Ruby's interrupt
+  checkpoints, so a pending `Thread#kill` at that point performs a non-local exit that skips any
+  Rust code placed after the call. The fix: do the shutdown/join *inside* the `without_gvl` closure,
+  before it returns (see that function's doc comment for the full account).
+- A dedicated safety-review pass on the above found three further issues, since fixed: (1) the
+  watchdog thread could also leak on a genuine early Rust-level error between spawning it and
+  reaching the `without_gvl` closure (e.g. the Tokio runtime failing to build) — fixed with an RAII
+  guard (`WatchdogGuard`) instead of a single manual call; (2) a `Condvar` spurious wakeup after
+  firing could re-fire for the same still-in-progress request, contradicting the "fires once"
+  design — fixed by re-checking the generation in a loop instead of a single `wait`; (3)
+  `rb_postponed_job_preregister`'s documented failure sentinel (the 32-slot table full) was never
+  checked — fixed with an explicit assertion at registration time. **A fourth, residual gap was
+  found while re-verifying (1) and is left open, not silently fixed**: the RAII guard doesn't
+  protect against the *same* non-local-exit mechanism the `Thread#kill`-after-`without_gvl` bug
+  above already found — a pending kill delivered during any Ruby/magnus call skips `Drop` too, not
+  just manually-placed cleanup code. Reordering `_serve_native` so the one Ruby call it needs
+  (`RackAppHandler::prepare_app`) happens *before* spawning the watchdog measurably narrowed this
+  (re-tested: 1 leak in 20 boot/kill iterations, down from roughly 1 in 2) but did not eliminate
+  it — something can still deliver a kill into that stretch of plain Rust/OS code with no Ruby call
+  in it, not fully root-caused. Low severity (one idle thread, bounded per occurrence, only
+  reachable during server *startup*, not steady-state operation) but real; worth a second look
+  before trusting this mechanism under a supervisor that rapidly boots/kills HelixRack servers.
+
 ## Phase 7 — Fault containment (RNF04)
 
 Ruby exceptions → HTTP 500. Rust panics caught (`catch_unwind`), never crash the process.
