@@ -21,10 +21,26 @@ jobs:
       - uses: oxidize-rb/actions/fetch-ci-data@v1
         id: fetch
         with:
+          # `x64-mingw-ucrt` added to the exclude list per PLAN.md's Phase 12
+          # Resolution note (and the Phase 10 "Known input" it flagged):
+          # mimalloc's vendored C source hits a genuine, currently-open
+          # upstream mingw-w64/Windows-SDK-header incompatibility
+          # (`ERROR_COMMITMENT_MINIMUM` undeclared) on this one platform,
+          # confirmed reproducing in an unrelated project too
+          # (github.com/emilk/egui/issues/7033) -- every other real
+          # deployment platform builds cleanly.
           supported-ruby-platforms: |
-            exclude: ["arm-linux", "x64-mingw32"]
+            exclude: ["arm-linux", "x64-mingw32", "x64-mingw-ucrt"]
+          # `3.0`/`3.1`/`3.2` excluded per PLAN.md's Phase 12 Resolution note:
+          # `helix_rack.gemspec`'s `required_ruby_version` was corrected to
+          # `>= 3.3.0` after a real cross-compile attempt found this
+          # extension's Phase 6 preemption mechanism (`ext/helix_rack/
+          # src/lib.rs`'s `rb_postponed_job_preregister`/`_trigger` calls)
+          # doesn't build against Ruby 3.2's own C headers -- that API was
+          # added in Ruby 3.3.0. Ruby 3.0/3.1 are older still and already
+          # past their own end of life, so excluded for the same reason.
           stable-ruby-versions: |
-            exclude: ["head"]
+            exclude: ["head", "3.0", "3.1", "3.2"]
 
   source-gem:
     runs-on: ubuntu-latest
@@ -70,3 +86,28 @@ jobs:
         with:
           name: cross-gem
           path: ${{ steps.cross-gem.outputs.gem-path }}
+
+  # Phase 12 (PLAN.md, Phase 12 "Gate"): what actually *runs*, in CI, the
+  # clean-container check `spec/integration/phase12_native_gem_spec.rb`
+  # encodes -- that spec is deliberately skipped in `main.yml`'s routine
+  # per-PR job (no prebuilt gem, no reason to pay for a rake-compiler-dock
+  # container pull on every commit), so this is the one place it actually
+  # asserts anything. Standalone, not dependent on `cross-gem`'s matrix
+  # artifacts (those share one artifact name across every platform, which
+  # would need extra logic just to find the right one) -- `rake gem:native`
+  # builds fresh, for the one platform this gate cares about.
+  verify-native-install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '4.0.6'
+          bundler-cache: true
+
+      - name: Build a precompiled native gem
+        run: bundle exec rake gem:native
+
+      - name: Verify it installs and runs with no build toolchain present
+        run: bundle exec rspec spec/integration/phase12_native_gem_spec.rb

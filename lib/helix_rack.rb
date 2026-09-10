@@ -1,7 +1,27 @@
 # frozen_string_literal: true
 
 require_relative "helix_rack/version"
-require "helix_rack/helix_rack"
+
+# Phase 12 (PLAN.md, Phase 12 "Gate"): a real precompiled native gem
+# (`rake gem:native`) packages the compiled extension under
+# `lib/helix_rack/<major.minor>/helix_rack.so` -- one per target Ruby ABI
+# version, not a single unversioned `lib/helix_rack/helix_rack.so` -- so a
+# plain `require "helix_rack/helix_rack"` can't find it there; confirmed by
+# reproducing the exact `LoadError: cannot load such file --
+# helix_rack/helix_rack` this caused when the packaged gem was first
+# installed and run in a clean container. Matches Nokogiri's own well-
+# established, exact convention for this (`nokogiri/extension.rb`, read
+# directly from the installed gem rather than guessed) -- including the
+# `rescue LoadError` fallback to the plain, unversioned `require`: this
+# project's own `bundle exec rake compile` dev loop (every phase before
+# this one) produces exactly that unversioned `lib/helix_rack/helix_rack.so`
+# and needs to keep working unchanged.
+begin
+  RUBY_VERSION =~ /(\d+\.\d+)/
+  require_relative "helix_rack/#{Regexp.last_match(1)}/helix_rack"
+rescue LoadError
+  require "helix_rack/helix_rack"
+end
 
 # A Rust-native HTTP/1.1 server embedding CRuby (rb-sys/magnus) for Rack/
 # Grape apps. See PRD.md and PLAN.md at the repo root.

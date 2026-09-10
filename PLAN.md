@@ -861,6 +861,74 @@ architectures) built cleanly. This phase needs to decide: exclude `x64-mingw-ucr
 platform list (matching the existing `exclude: ["arm-linux", "x64-mingw32"]` precedent in
 `build-gems.yml`'s `ci-data` job), or revisit once upstream fixes it -- not decided yet.
 
+**Resolution:**
+
+- **`x64-mingw-ucrt` excluded** (`.github/workflows/build-gems.yml`'s `ci-data` job, alongside the
+  existing `arm-linux`/`x64-mingw32` entries) -- the "Known input" above, now decided: the upstream
+  mimalloc/mingw-w64 header issue is currently open with no workaround, confirmed reproducing in an
+  unrelated project too (`github.com/emilk/egui/issues/7033`), and every other real deployment platform
+  builds cleanly. Revisit once upstream fixes it.
+- **Three real, previously-undiscovered bugs, all found by actually attempting this phase's deliverable
+  rather than assuming it would work** (the same "de-risk by trying it for real" discipline Phase 10's
+  `workflow_dispatch` run established, applied here via a local `rake gem:native` build against the real
+  `rbsys/x86_64-linux` rake-compiler-dock image, plus an actual clean-container install/run):
+  1. **`exe/helix_rack --version` was broken.** `OptionParser` recognizes `--version` unconditionally, but
+     without `parser.version` set it prints `"helix_rack: version unknown"` and exits `1` -- confirmed by
+     running it directly before touching anything. `--help` already worked (`OptionParser` provides that
+     one without any configuration). Fixed with one line, `parser.version = HelixRack::VERSION`
+     (`exe/helix_rack`).
+  2. **`helix_rack.gemspec`'s `required_ruby_version = ">= 3.2.0"` was wrong.** A real multi-Ruby-version
+     cross-compile (the `rbsys/x86_64-linux` image bundles Ruby 3.0 through 4.0) failed outright for Ruby
+     3.2.11 with `cannot find function 'rb_postponed_job_preregister'` -- Phase 6's preemption mechanism
+     (`ext/helix_rack/src/lib.rs`) calls that C API, and Ruby's own C headers, unconditionally, no
+     version-gated fallback. Verified (web search, not assumed) that `rb_postponed_job_preregister`/
+     `_trigger` were added in Ruby 3.3.0. Fixed by correcting `required_ruby_version` to `>= 3.3.0`
+     (`helix_rack.gemspec`, with the reasoning recorded directly in that file's own comment) rather than
+     attempting a Ruby-version-conditional compile path for Phase 6's already-shipped, safety-reviewed
+     mechanism -- out of proportion for what this phase actually needed. Ruby 3.2 itself reached its own
+     end of life on 2026-03-31 (web-search-verified), already past by the time this was caught, so this
+     costs nothing currently supported. `build-gems.yml`'s `ci-data` job's `stable-ruby-versions` exclude
+     list updated to match (`"3.0", "3.1", "3.2"` added -- 3.0/3.1 are older still and already EOL too).
+     `.rubocop.yml`'s `TargetRubyVersion` corrected from `3.2` to `3.3` to match -- rubocop's own
+     `Gemspec/RequiredRubyVersion` cop caught the drift between the two once the gemspec changed.
+  3. **The compiled extension couldn't be `require`d from a real installed native gem at all.** A
+     precompiled, multi-Ruby-ABI native gem packages the compiled extension under
+     `lib/helix_rack/<major.minor>/helix_rack.so` (one per target Ruby version), not a single unversioned
+     `lib/helix_rack/helix_rack.so` -- `lib/helix_rack.rb`'s plain `require "helix_rack/helix_rack"`
+     can't find that, reproduced directly as `LoadError: cannot load such file -- helix_rack/helix_rack`
+     the first time the packaged gem was installed and run in a clean container. Fixed by matching
+     Nokogiri's own well-established convention for this exact problem (read directly from the installed
+     `nokogiri` gem's `lib/nokogiri/extension.rb`, not guessed): `RUBY_VERSION =~ /(\d+\.\d+)/;
+     require_relative "helix_rack/#{Regexp.last_match(1)}/helix_rack"`, with a `rescue LoadError` fallback
+     to the plain, unversioned `require` -- this project's own `bundle exec rake compile` dev loop (every
+     phase before this one) produces exactly that unversioned `.so` and needed to keep working unchanged;
+     verified it still does.
+- **`rake gem:native`** (new `Rakefile` task) builds a real, precompiled, platform-tagged native gem for
+  `x86_64-linux` via `rake-compiler-dock`, restricted to the corrected `>= 3.3` Ruby versions
+  (`RUBY_CC_VERSION` set inside the container's own shell command -- `RakeCompilerDock.sh` doesn't forward
+  arbitrary host env vars into the container it runs, confirmed by reading the actual `docker run` command
+  it printed on a first attempt). `RCD_IMAGE` set internally to `rbsys/x86_64-linux:<the loaded rb_sys
+  gem's own version>`, not hardcoded: `RakeCompilerDock` never auto-detects `rb_sys` -- its own *default*
+  image has no Rust toolchain at all (confirmed directly: no `cargo` binary anywhere in it), and the
+  `rbsys/<platform>` image family (the one `oxidize-rb/actions/cross-gem@v1` already uses in CI) has to be
+  requested explicitly.
+- **The gate itself is `spec/integration/phase12_native_gem_spec.rb`**, a real `docker run` against a
+  plain `ruby:3.4-slim` image (confirmed to have no `gcc`/`cc`/`cargo`/`rustc`/`make`), asserting the exact
+  `gem install` exit code, `helix_rack --version`/`--help` output and exit codes, all inside that
+  toolchain-less container -- not a check reimplemented or simulated, the real CLI run for real. Not
+  synthetically injected-and-reverted the way Phase 9/10/11's gates were verified non-tautological: this
+  one caught all three bugs above *for real*, on the first three attempts, before any of them were fixed --
+  stronger evidence than a synthetic injection would have been.
+- **Deliberately skipped, not run, in `bundle exec rspec`/`main.yml`'s routine per-PR job**: building the
+  gem takes real minutes (a rake-compiler-dock container pull plus a genuine cross-compile) and needs
+  Docker and network access neither routine job provides or should pay for on every commit -- matching
+  Phase 10's own `workflow_dispatch`-not-`main.yml` scoping for the same class of cost. The spec's own
+  `before` guards `skip` (not raise/fail) when Docker isn't on `PATH` or no prebuilt gem exists at the
+  expected path, matching the shape Phase 9/10's own gate notes already established for this.
+  `.github/workflows/build-gems.yml`'s new `verify-native-install` job is what actually runs it for real:
+  `rake gem:native` then `bundle exec rspec spec/integration/phase12_native_gem_spec.rb`, on the same
+  `workflow_dispatch`/tag-push triggers as the rest of that workflow.
+
 ## Phase 13 — Benchmarking (PRD section 7.2) — explicitly NOT deterministic, treat differently
 
 Wall-clock P99/RSS/RPS numbers vary by machine, kernel, and noise. This phase is a **threshold

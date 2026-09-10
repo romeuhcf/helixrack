@@ -25,6 +25,14 @@ options = {
 # up for a line-count target.
 OptionParser.new do |parser|
   parser.banner = "Usage: helix_rack [options]"
+  # Phase 12 (PLAN.md, Phase 12 "Gate"): `--help` already worked without
+  # this (`OptionParser` recognizes it unconditionally, printing the banner
+  # + summary and exiting 0) -- confirmed by running it directly before
+  # writing this. `--version` did not: `OptionParser` recognizes `--version`
+  # unconditionally too, but without `.version` set it prints "helix_rack:
+  # version unknown" and exits 1, confirmed the same way. Setting it here is
+  # what makes `--version` print "helix_rack <version>" and exit 0.
+  parser.version = HelixRack::VERSION
   parser.on("-a", "--app PATH", "Path to the Rackup / Grape app (default: config.ru)") do |v|
     options[:app] = v
   end
