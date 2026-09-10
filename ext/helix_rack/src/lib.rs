@@ -1296,6 +1296,18 @@ fn read_body(ruby: &Ruby, body: Value) -> Result<ResponseBody, Error> {
 /// codebase: `spec/support/phase6_server_helper.rb`'s test harness boots and
 /// kills many short-lived servers in the same RSpec process, and a leaked
 /// watchdog thread per example would accumulate for the rest of the run).
+///
+/// `grace_period_seconds` implements `PLAN.md`'s Phase 8 (PRD.md section
+/// 6.2's `--grace-period`, threaded the same way): bounds how long the
+/// drain step (this function's own doc comment on the `tokio::select!`
+/// below) waits for already-accepted connections to finish once shutdown
+/// starts.
+// `ruby` isn't a caller-facing argument (magnus supplies it, per the
+// `#[magnus::init]`-adjacent `function!` convention already used for every
+// other `Error`-returning native entry point in this file) -- seven real
+// config knobs is what PRD.md section 6.2's table asks this function to
+// accept and validate in one place, not a natural grouping to split up.
+#[allow(clippy::too_many_arguments)]
 fn _serve_native(
     ruby: &Ruby,
     app: Value,
@@ -1304,6 +1316,7 @@ fn _serve_native(
     keep_alive_timeout_seconds: i64,
     max_keepalive: i64,
     cpu_time_slice_ms: i64,
+    grace_period_seconds: i64,
 ) -> Result<(), Error> {
     let port = u16::try_from(port).map_err(|_| {
         Error::new(
@@ -1345,6 +1358,13 @@ fn _serve_native(
         )
     })?;
     let cpu_time_slice = Duration::from_millis(cpu_time_slice_ms);
+    let grace_period_seconds = u64::try_from(grace_period_seconds).map_err(|_| {
+        Error::new(
+            ruby.exception_arg_error(),
+            format!("grace_period {grace_period_seconds} must not be negative"),
+        )
+    })?;
+    let grace_period = Duration::from_secs(grace_period_seconds);
 
     // Every Ruby/magnus-API call this function needs happens *before*
     // `watchdog::Watchdog::spawn` below, not after -- see that call's own
@@ -1404,9 +1424,29 @@ fn _serve_native(
     // Wrapped in `gvl::without_gvl` -- see this module's top doc comment for
     // why that's necessary here. `Handler::call` (via `RackAppHandler`)
     // reacquires the GVL with `gvl::with_gvl` for each request. `serve`
-    // itself never returns on its own (Phase 8 -- graceful shutdown -- is
-    // what teaches it to), so it's raced against `cancelled`, which resolves
-    // once `without_gvl`'s unblock function has fired (see `gvl::without_gvl`).
+    // itself never returns on its own, so it's raced against `cancelled`,
+    // which resolves once either `without_gvl`'s unblock function has fired
+    // (`Thread#kill`, in tests) or a `SIGTERM`/`SIGINT` trap has called
+    // `request_shutdown` directly (Phase 8, `PLAN.md`, Phase 8/RNF05,
+    // `lib/helix_rack.rb`'s `install_shutdown_traps`) -- read `cancelled`'s
+    // own doc comment before touching either path: this two-source design
+    // exists because the unblock-function path alone was measured to be
+    // permanently unreliable for a signal arriving during nested Ruby-level
+    // blocking I/O, not merely slow, and that finding (plus the fix) is
+    // documented there in full rather than duplicated here.
+    //
+    // Once `cancelled` does resolve, `select!` dropping the losing
+    // `serve(...)` future closes `listener` (bound inside that same
+    // future), which stops the accept loop from taking any *new*
+    // connection -- what `select!` alone does *not* do is let each
+    // already-`spawn_local`'d, still-in-flight connection task keep running
+    // afterward; that's `drain` below. And per `cancelled`'s doc comment,
+    // `select!` itself cannot even be polled again to notice `cancelled`
+    // resolving while a connection's `Handler::call` is synchronously
+    // executing -- "stop accepting new connections" in practice means "once
+    // whatever was already in flight when the signal arrived finishes, not
+    // a moment before"; read `PLAN.md`'s Phase 8 Resolution note before
+    // assuming otherwise.
     //
     // `watchdog_guard` is dropped *explicitly, inside* this closure, right
     // after `block_on` returns and before the closure itself returns --
@@ -1449,10 +1489,32 @@ fn _serve_native(
     let result: std::io::Result<()> = gvl::without_gvl(|cancel| {
         let result = runtime.block_on(local_set.run_until(async move {
             let listener = tokio::net::TcpListener::bind((bind.as_str(), port)).await?;
-            tokio::select! {
+            // A second `Arc` clone, distinct from the one `serve` (below)
+            // takes ownership of: `drain` (below) needs `connections` to
+            // still be alive and readable *after* `serve`'s future is
+            // dropped as `select!`'s losing branch, not just while it's
+            // running.
+            let connections_for_drain = Arc::clone(&connections);
+            let served = tokio::select! {
                 res = serve(listener, connections, handler, max_keepalive, keep_alive_timeout) => res,
                 () = cancelled(cancel) => Ok(()),
-            }
+            };
+
+            // Phase 8 (`PLAN.md`, Phase 8/RNF05)'s actual deliverable: once
+            // `listener` has already stopped accepting (whether `serve`
+            // itself returned an `Err`, which is not expected in practice,
+            // or -- the real case this exists for -- `cancelled` won that
+            // race and dropped `serve`'s future, closing `listener` with
+            // it), give every connection `spawn_local`'d before that point
+            // a chance to actually finish its in-flight response, bounded
+            // by `grace_period`, before this whole future -- and the
+            // `LocalSet` driving those tasks along with it -- returns and
+            // drops them. Runs even on `serve`'s `Err` path too: a
+            // connection accepted just before a bind/accept-level error
+            // still deserves its grace period, not an unconditional cut.
+            connections_for_drain.drain(grace_period).await;
+
+            served
         }));
 
         drop(watchdog_guard);
@@ -1464,23 +1526,133 @@ fn _serve_native(
 }
 
 /// Polls `cancel` (set by `gvl::without_gvl`'s unblock function, e.g. when
-/// something `Thread#kill`s the calling Ruby thread) every 20ms, resolving
-/// once it's `true`. Not a low-latency wakeup -- see this module's top doc
-/// comment -- just enough that `_serve_native` returns within a bounded,
-/// short time instead of never.
+/// something `Thread#kill`s the calling Ruby thread) **and**
+/// [`SHUTDOWN_REQUESTED`] (set directly by [`request_shutdown`], called
+/// from the `SIGTERM`/`SIGINT` trap `lib/helix_rack.rb`'s
+/// `HelixRack.serve` installs -- Phase 8, `PLAN.md`, Phase 8/RNF05) every
+/// 20ms, resolving once either is `true`.
+///
+/// Two independent sources feeding one check, not one mechanism reused,
+/// because Phase 8's own gate development found `cancel` alone is not
+/// reliable for the signal case -- the central finding of this phase,
+/// worth the long account below since it directly shapes why this
+/// function looks the way it does.
+///
+/// **What's solid, verified two ways:** while *any* connection's
+/// `Handler::call` (`RackAppHandler`, this file) is synchronously
+/// executing, this whole runtime's single OS thread (PRD.md RNF01,
+/// `PLAN.md`'s Phase 2 architecture note) cannot make progress on anything
+/// else -- not the accept loop, not this very function's own 20ms timer --
+/// since `Handler::call` is a plain synchronous Rust function with no
+/// `.await` point in it. Ruby's own GVL release during a handler's
+/// blocking I/O (verified in Phase 5) helps a *separate* Ruby `Thread` on
+/// a *separate* OS thread -- it does nothing for *this* OS thread's own
+/// stalled reactor.
+///
+/// **What's the actual Phase 8 finding, also verified, not merely
+/// theorized:** that alone would only explain a *bounded* delay (the
+/// signal gets noticed once the in-flight call returns). Direct
+/// measurement showed something stronger and worse: if a real `SIGTERM`
+/// arrives while a handler is blocked inside a *nested* Ruby-level
+/// blocking I/O call (this project's Phase 8 fixture: a `TCPSocket#read`,
+/// itself internally GVL-releasing, invoked from inside this file's own
+/// `gvl::with_gvl` reacquisition, itself inside the outer
+/// `gvl::without_gvl` span `cancel`'s UBF is registered against), `cancel`
+/// can fail to flip at all -- confirmed with a throwaway script that sent
+/// `SIGTERM` in that exact window, then let the process sit completely
+/// idle (no further requests, no polling) for 90 full seconds: `cancel`
+/// never flipped once, for the rest of that process's life. Two control
+/// experiments with the same script shape -- a `SIGTERM` sent after
+/// handling one *fast* request first, and one sent after a request that
+/// merely `sleep`s (also GVL-releasing, but not nested Ruby I/O) --
+/// resolved promptly every time, ruling out "any prior GVL release" or
+/// general system load as the cause; the specific nested-I/O-at-
+/// signal-time window is what reproduces it. The precise MRI-internal
+/// mechanism (plausible candidate: the inner blocking read's own,
+/// separately-registered UBF somehow never yields the "active for signal
+/// delivery" slot back to the outer `without_gvl`'s UBF once it returns)
+/// was not fully root-caused -- this doc comment states what was
+/// *measured*, not a confirmed CRuby internals explanation.
+///
+/// **The fix, not a workaround:** don't depend on `cancel`/the UBF path
+/// for the signal case at all. `install_shutdown_traps`'s trap body calls
+/// [`request_shutdown`] directly -- a plain magnus-registered function
+/// call from Ruby code that's already running (confirmed, every test run,
+/// that the trap block itself always does run promptly even when `cancel`
+/// never flips), setting a flag this function polls independently of
+/// whatever state the UBF path is in. `cancel` still matters for
+/// `Thread#kill`-driven cancellation (`spec/support/phase*_server_helper.rb`'s
+/// test harnesses), which was never observed to have this failure mode --
+/// but is no longer this function's only way to learn about a signal.
 async fn cancelled(cancel: &AtomicBool) {
-    while !cancel.load(Ordering::SeqCst) {
+    while !cancel.load(Ordering::SeqCst) && !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// Process-global, not per-`_serve_native`-call -- unlike `cancel`, which
+/// `gvl::without_gvl` allocates fresh per call, this must be settable from
+/// a Ruby trap context that has no access to any one call's own local
+/// state. Reset by [`reset_shutdown_request`], set by [`request_shutdown`],
+/// read only by [`cancelled`].
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// `HelixRack._request_shutdown` -- called directly from the Ruby-level
+/// `SIGTERM`/`SIGINT` trap `lib/helix_rack.rb`'s `install_shutdown_traps`
+/// installs, **not** from anywhere else. See [`cancelled`]'s doc comment
+/// for the full account of why a second, UBF-independent cancellation
+/// signal exists at all: a real `SIGTERM` arriving while a handler is
+/// blocked in nested Ruby-level I/O was measured to permanently prevent
+/// the existing `cancel`/UBF path from ever flipping, and this function is
+/// the fix, not a fallback for a merely-slow case. Deliberately trivial
+/// (one atomic store, no allocation, nothing that can raise) -- it runs
+/// from inside a Ruby trap context, and this project's own
+/// `watchdog::postponed_job_callback` doc comment already establishes why
+/// a callback MRI can invoke at an arbitrary, hard-to-reason-about point
+/// should stay that simple.
+fn request_shutdown() {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// `HelixRack._reset_shutdown_request` -- called from `lib/helix_rack.rb`'s
+/// `HelixRack.serve`, *before* `install_shutdown_traps` installs the traps
+/// that can call [`request_shutdown`], and before `_serve_native` runs.
+///
+/// A safety-review finding corrected this call site's placement from an
+/// earlier version, worth recording since the fix direction is
+/// counter-intuitive at first: the earlier version reset from *inside*
+/// `_serve_native`, *after* `install_shutdown_traps` had already run in
+/// `HelixRack.serve` -- reasoning (wrongly) that the risk was a signal
+/// landing in the gap between the reset and the accept loop starting. Direct
+/// tracing of the actual code path showed the real, silent gap runs the
+/// *other* direction: `install_shutdown_traps` armed the traps first, so
+/// any signal landing between that and the (later) reset call had its
+/// `SHUTDOWN_REQUESTED.store(true, ...)` immediately erased by the reset
+/// that ran after it -- not delayed, erased, requiring a second signal to
+/// notice anything at all. Worse under Kubernetes than it sounds: `serve`
+/// is typically called from a background thread in this project's own
+/// same-process test harnesses (`spec/support/phase{2,5,6}_server_helper.rb`),
+/// and MRI runs trap bodies on the *main* thread -- so the old ordering was
+/// a genuine cross-thread race, not a same-thread instruction gap. Resetting
+/// before the traps are even installed closes it: nothing can call
+/// `request_shutdown` for *this* server run until after this has already
+/// run.
+fn reset_shutdown_request() {
+    SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
 }
 
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
     let module = ruby.define_module("HelixRack")?;
-    module.define_module_function("_serve_native", magnus::function!(_serve_native, 6))?;
+    module.define_module_function("_serve_native", magnus::function!(_serve_native, 7))?;
     module.define_module_function(
         "_postponed_job_count",
         magnus::function!(watchdog::postponed_job_count, 0),
+    )?;
+    module.define_module_function("_request_shutdown", magnus::function!(request_shutdown, 0))?;
+    module.define_module_function(
+        "_reset_shutdown_request",
+        magnus::function!(reset_shutdown_request, 0),
     )?;
     // Phase 6 (`PLAN.md`, Phase 6): pre-registers the postponed job callback
     // exactly once, at extension load time -- see `watchdog::register`'s doc
