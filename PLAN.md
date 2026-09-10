@@ -190,22 +190,45 @@ back from `Handler::call` -- not something `Handler`/`ext/helix_rack` needs to k
 
 GVL held only for `.call(env)`; released during socket read/write and idle wait.
 
-**Narrowed scope (Phase 2 shipped a coarse version early):** Phase 2's real implementation already
-had to add `rb_thread_call_without_gvl`/`_with_gvl` release around the whole idle/accept portion of
-the run, for reasons unrelated to this phase (see Phase 2's GVL architecture note) — coarse-grained,
-released once per `_serve_native` call rather than per read/write. This phase's job is narrower than
-originally scoped: upgrade that release to per-I/O-operation granularity (so a slow client blocked
-mid-read doesn't hold the GVL any longer than Phase 1-4's connection-handling loop actually needs
-it), not introduce GVL release from scratch.
+**Re-scoped after re-examining what's actually left (the original gate below described something
+architecturally impossible in this project's design — corrected here, not carried forward):**
 
-**Deliverable:** correct `rb_thread_call_without_gvl` usage around I/O.
+Phase 2's real implementation already releases the GVL (`rb_thread_call_without_gvl`, coarse-
+grained: once per `_serve_native` call, covering the *entire* Tokio runtime's lifetime) for
+everything except the synchronous span of each request's `Handler::call`. Since Rust's own
+parsing/socket I/O never touches Ruby, this already means the GVL is free during all of it —
+`engine`'s side of RF06 ("release during socket read/write and idle wait") is already satisfied by
+Phase 2's architecture, not something left for this phase to add.
 
-**Gate — avoid sleep-based flakiness, use synchronization instead:**
-A fixture app blocks on a controlled barrier (e.g. reading from a pipe/socket that the test holds
-open) instead of `sleep`. While request A is blocked on that barrier, the test fires request B
-and asserts B's response arrives **before** the test releases A's barrier. This proves the GVL
-wasn't held across A's I/O wait — an ordering assertion, not a timing one, so it's reproducible on
-any machine speed.
+What is genuinely open: whether the GVL is actually available to *other Ruby threads in the same
+process* while one request's `Handler::call` is itself blocked inside the Rack app's own code
+(e.g. a slow synchronous DB query, or literally `sleep`). This is a real, useful property (a Rack
+app that spawns its own background `Thread`s, or a future multi-connection design, would starve
+without it) — but it is **not** "request B on a different HTTP connection gets served while
+request A is blocked": this server is single-OS-thread (PRD.md RNF01), and Tokio's own event loop
+lives on that *same* thread. A synchronous blocking call inside the Rack app's Ruby code doesn't
+hand control back to Tokio no matter what happens to the GVL — the OS thread itself is stuck
+inside that call. Proving "another connection gets serviced concurrently" during that window would
+require a different OS-thread model than this project has (or Phase 6's preemption mechanism,
+which is a different, narrower tool: interrupting a *long-running Ruby computation*, not unblocking
+I/O). The original gate below asked for exactly that impossible thing and must not be reused
+as-is.
+
+**What this phase's gate should actually prove instead:** while request A's `Handler::call` is
+blocked inside the Rack app on a controlled barrier (a genuinely GVL-yielding blocking call —
+verify empirically, don't assume, which Ruby I/O primitive actually yields the GVL for this
+purpose; a plain busy-loop does not), a *separate Ruby `Thread`* the test itself spawns (standing
+in for a Rack app's own background thread, or any other Ruby work sharing this process) makes real
+progress and that progress is observed **before** the test releases A's barrier — an ordering
+assertion against a same-process Ruby thread, not a second HTTP request. If empirical verification
+finds this is already true given Phase 2's existing coarse release (plausible: Ruby's own blocking
+I/O primitives are documented to release the GVL internally, independent of magnus's own
+with_gvl/without_gvl nesting), this phase's deliverable becomes a regression gate proving it, not
+new engine code — a valid, complete outcome, not a sign the investigation was incomplete.
+
+**Deliverable:** either confirmation (with a gate) that Phase 2's existing coarse release already
+gives other same-process Ruby threads GVL access during a blocked `Handler::call`, or, if that
+turns out false, the fix that makes it true.
 
 ## Phase 6 — Preemption / time-slicing (RF07)
 
