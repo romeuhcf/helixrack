@@ -97,6 +97,28 @@ pub fn spawn_server() -> TestServer {
 /// getting the Phase 1-3-safe defaults.
 #[allow(dead_code)]
 pub fn spawn_server_with(max_keepalive: usize, keep_alive_timeout: Duration) -> TestServer {
+    spawn_server_with_handler(FixedResponseHandler, max_keepalive, keep_alive_timeout)
+}
+
+/// Same as [`spawn_server_with`], but also lets the caller supply any
+/// [`Handler`] instead of always getting [`FixedResponseHandler`] -- for
+/// gates that need a response shape `FixedResponseHandler` can't produce
+/// (e.g. a response missing `Content-Length` on purpose).
+///
+/// `H: Send` here is a constraint of *this test helper* (the handler value
+/// is moved into a spawned OS thread), not of the production `Handler`
+/// trait, which deliberately isn't `Send` (a magnus-backed handler holds a
+/// non-`Send` Ruby `Value` -- see `PLAN.md`'s Phase 2 "Architecture note").
+/// Every handler `engine/tests/` constructs is a trivial synthetic struct
+/// with no Ruby involvement, so this is never a real restriction here --
+/// only `ext/helix_rack`'s `RackAppHandler` needs the non-`Send` relaxation,
+/// and it's never used from this crate's own tests.
+#[allow(dead_code)]
+pub fn spawn_server_with_handler<H: Handler + Send + 'static>(
+    handler: H,
+    max_keepalive: usize,
+    keep_alive_timeout: Duration,
+) -> TestServer {
     let std_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind ephemeral test port");
     let addr = std_listener
         .local_addr()
@@ -135,7 +157,7 @@ pub fn spawn_server_with(max_keepalive: usize, keep_alive_timeout: Duration) -> 
             serve(
                 tokio_listener,
                 connections_for_thread,
-                Rc::new(FixedResponseHandler),
+                Rc::new(handler),
                 max_keepalive,
                 keep_alive_timeout,
             )

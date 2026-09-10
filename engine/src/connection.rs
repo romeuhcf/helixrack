@@ -231,6 +231,17 @@ pub(crate) async fn handle(
                 .headers
                 .retain(|(name, _)| !name.trim().eq_ignore_ascii_case("connection"));
 
+            // A response with a body but neither Content-Length nor
+            // Transfer-Encoding leaves the client with no way to know where
+            // the body ends -- harmless on the final (Connection: close)
+            // response, since EOF marks the end, but on every other one the
+            // client keeps waiting for more body bytes while this loop
+            // waits for the next request on the same socket: a hang, only
+            // ever broken by `keep_alive_timeout`. Found by this phase's
+            // code review, not by any existing gate (every fixture app used
+            // so far always set Content-Length itself).
+            ensure_framing(&mut response).await?;
+
             requests_served += 1;
             let is_last_allowed_request = requests_served >= max_keepalive;
             if is_last_allowed_request {
@@ -366,12 +377,52 @@ fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
+/// Ensures `response` has valid HTTP/1.1 message framing before
+/// [`serialize_head`]/[`write_body`] write it -- see the call site in
+/// [`handle`] for why a response with a body but neither `Content-Length`
+/// nor `Transfer-Encoding` is a real hang hazard on a persistent connection,
+/// not just a cosmetic gap.
+///
+/// Only ever injects `Content-Length`, never `Transfer-Encoding`/chunked --
+/// this engine doesn't speak chunked encoding (PRD.md's scope). Both
+/// `ResponseBody` variants always have a knowable exact length before any
+/// bytes are written, so this is always possible when framing is missing.
+/// Does *not* second-guess a `Content-Length` the handler already set (even
+/// if it were wrong) -- only fills the gap when neither header is present
+/// at all, consistent with "the handler is responsible for every header it
+/// sets" everywhere else in this module.
+async fn ensure_framing(response: &mut HandlerResponse) -> io::Result<()> {
+    let has_framing = response.headers.iter().any(|(name, _)| {
+        let name = name.trim();
+        name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("transfer-encoding")
+    });
+    if has_framing {
+        return Ok(());
+    }
+
+    let body_len: u64 = match &response.body {
+        ResponseBody::InMemory(bytes) => bytes.len() as u64,
+        ResponseBody::Spooled(file) => {
+            // A duplicated fd (same underlying file, own seek position --
+            // `write_body` relies on the same `try_clone` pattern), so
+            // reading its metadata doesn't disturb whatever position the
+            // original `File` is left at.
+            let duplicated = file.try_clone()?;
+            tokio::fs::File::from_std(duplicated).metadata().await?.len()
+        }
+    };
+    response
+        .headers
+        .push(("Content-Length".to_string(), body_len.to_string()));
+    Ok(())
+}
+
 /// Serializes a [`HandlerResponse`]'s front matter into real HTTP/1.1 bytes:
-/// a status line with a reason phrase, the given headers verbatim (no
-/// injected `Content-Length` or similar -- the handler is responsible for
-/// every header it wants sent), then a blank line. The body is a separate
-/// step ([`write_body`]) since, as of Phase 3, it isn't always already a
-/// byte slice sitting in memory to append here.
+/// a status line with a reason phrase, the given headers verbatim (by the
+/// time this runs, [`ensure_framing`] has already guaranteed valid framing
+/// -- this function itself injects nothing), then a blank line. The body is
+/// a separate step ([`write_body`]) since, as of Phase 3, it isn't always
+/// already a byte slice sitting in memory to append here.
 fn serialize_head(response: &HandlerResponse) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(128);
     bytes.extend_from_slice(

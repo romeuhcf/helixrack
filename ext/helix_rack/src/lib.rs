@@ -538,6 +538,20 @@ fn _serve_native(
             format!("max_keepalive {max_keepalive} must not be negative"),
         )
     })?;
+    // Rejected here, at the configuration boundary, rather than given some
+    // in-loop meaning: `connection::handle` always answers the request it
+    // already parsed off the wire before it has any chance to check this
+    // value (there's no sensible way to reject a request that's already
+    // been read), so 0 can't mean "answer none" -- better to refuse a
+    // config value with no coherent meaning than silently treat it as 1.
+    if max_keepalive == 0 {
+        return Err(Error::new(
+            ruby.exception_arg_error(),
+            "max_keepalive must be at least 1 (0 has no coherent meaning: a connection always \
+             answers the request it already read off the wire before this limit is checked)"
+                .to_string(),
+        ));
+    }
     let keep_alive_timeout = Duration::from_secs(keep_alive_timeout_seconds);
 
     let handler: Rc<dyn Handler> = Rc::new(RackAppHandler::new(ruby, app, port)?);

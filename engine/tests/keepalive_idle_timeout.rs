@@ -28,6 +28,18 @@ const IDLE_TIMEOUT: Duration = Duration::from_millis(300);
 /// firing, or firing only on the next unrelated wakeup) implementation.
 const EPSILON: Duration = Duration::from_millis(300);
 
+/// Tolerance subtracted from `IDLE_TIMEOUT` for the lower bound. The
+/// client's `start` timestamp is taken *after* `TcpStream::connect`
+/// returns, but the server's `tokio::time::timeout` clock effectively
+/// starts at `accept()`, which can complete (and so start counting down)
+/// slightly before the client's local timestamp is captured -- a real,
+/// correct implementation could otherwise measure `elapsed` a hair under
+/// `IDLE_TIMEOUT` and fail this assertion for a reason that has nothing to
+/// do with the server's actual timeout behavior. Much smaller than
+/// `EPSILON`: this only needs to absorb connect/accept handshake skew, not
+/// scheduling jitter on the close side.
+const LOWER_SKEW_TOLERANCE: Duration = Duration::from_millis(50);
+
 /// A very large `max_keepalive`: this test only exercises the idle timeout,
 /// not max-keepalive (that's keepalive_max_requests.rs's job) -- nothing
 /// here sends any request at all.
@@ -63,8 +75,9 @@ fn idle_connection_is_closed_within_the_configured_timeout() {
     }
 
     assert!(
-        elapsed >= IDLE_TIMEOUT,
-        "connection closed too early: waited {elapsed:?}, configured idle timeout is {IDLE_TIMEOUT:?}"
+        elapsed >= IDLE_TIMEOUT.saturating_sub(LOWER_SKEW_TOLERANCE),
+        "connection closed too early: waited {elapsed:?}, configured idle timeout is \
+         {IDLE_TIMEOUT:?} (lower bound allows {LOWER_SKEW_TOLERANCE:?} of connect/accept skew)"
     );
     assert!(
         elapsed <= IDLE_TIMEOUT + EPSILON,
