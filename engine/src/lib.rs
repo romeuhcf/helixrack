@@ -216,6 +216,16 @@ pub async fn serve(
                 continue;
             }
         };
+        // Nagle's algorithm is on by default and buffers small writes
+        // waiting for either a full segment or the peer's ACK. `connection`
+        // writes a response as a separate head `write_all` then a body
+        // `write_all` (see `connection::handle`'s own doc comment), which is
+        // exactly the pattern Nagle plus a delayed ACK on the client side
+        // stalls on (measured: ~40ms, matching Linux's delayed-ACK timer).
+        // Best-effort: a failed `set_nodelay` shouldn't drop a connection
+        // that otherwise accepted fine, so the error is ignored here rather
+        // than handled like `accept()`'s own failure above.
+        let _ = socket.set_nodelay(true);
         connections.record_accept();
         let handler = Rc::clone(&handler);
         let connections = Arc::clone(&connections);

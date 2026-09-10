@@ -1140,6 +1140,48 @@ gate under a fixed methodology**, not a single deterministic assertion:
   mechanism responsible is already understood and documented, not a mystery to chase further within
   this phase.
 
+**Post-Phase-13 follow-up: `TCP_NODELAY` (a real, measured fix, applied after Phase 13's PR merged,
+on its own branch/PR, not folded back into Phase 13's own history)**:
+
+- **Finding**: `engine/src/lib.rs`'s `serve` never called `set_nodelay` on an accepted socket, so
+  Nagle's algorithm stayed on (its default), and `engine/src/connection.rs` writes a response as a
+  separate head `write_all` then a body `write_all` -- exactly the pattern that stalls under
+  Nagle-plus-delayed-ACK. `hello_world`'s p99 (42.23-42.86ms, a suspiciously tight range across 10
+  independent runs) was consistent with a fixed per-request stall, not queueing noise, and close to
+  Linux's classic ~40ms delayed-ACK timer. Checked against real source, not assumed: Puma's own
+  `binder.rb` does call `setsockopt(..., TCP_NODELAY, 1)` -- a real, verified asymmetry between
+  HelixRack and its own Gate baseline.
+- **Fix**: one line, `let _ = socket.set_nodelay(true);` right after `listener.accept()` in
+  `engine/src/lib.rs`, best-effort (errors ignored, same as an accepted-but-otherwise-unusable
+  socket shouldn't crash the accept loop). Touches neither `ext/`, GVL acquire/release points, nor
+  `unsafe` Rust, so this repo's own CLAUDE.md `safety-reviewer` requirement does not apply; verified
+  with `cargo clippy` (both crates), `cargo test --manifest-path engine/Cargo.toml`, and `bundle
+  exec rspec` x3 instead.
+- **Re-measured with the same N=10, VUS=50, 15s methodology** (`hello_world`/`io_mixed` only --
+  `cpu_bound` already passed the Gate before this fix and its response is dominated by real compute,
+  not this stall, so it wasn't expected to move and wasn't re-run):
+
+  | scenario | server | P99 median (ms) | P99 range | RSS median (MiB) | RSS range |
+  |---|---|---|---|---|---|
+  | hello_world | helix_rack | 8.12 | 3.25-21.0 | 24.8 | 24.3-25.6 |
+  | hello_world | puma | 11.18 | 7.29-19.18 | 116.8 | 113.4-130.3 |
+  | hello_world | falcon | 10.11 | 7.12-14.26 | 43.0 | 42.0-54.4 |
+  | io_mixed | helix_rack | 23.82 | 13.62-33.91 | 55.0 | 54.4-73.1 |
+  | io_mixed | puma | 29.31 | 20.73-62.27 | 85.4 | 82.4-119.0 |
+  | io_mixed | falcon | 27.47 | 22.52-49.42 | 67.6 | 65.5-83.4 |
+
+- **Result: still GATE FAILED on both scenarios' P99 ratio (and `io_mixed`'s RSS ratio, unaffected by
+  this fix, as expected), but by a much smaller margin, and HelixRack now has the lowest absolute p99
+  of all three servers in both scenarios** -- `hello_world` p99 dropped from 42.47ms to 8.12ms (a
+  ~5.2x reduction), beating Puma (11.18ms) and Falcon (10.11ms) outright; `io_mixed` dropped from
+  45.07ms to 23.82ms, likewise beating both. The Gate's own ratio, though, needs HelixRack at <=60%
+  of Puma's p99, not merely lower than it: `hello_world` is now 0.727 (was 3.482), `io_mixed` is now
+  0.813 (was 1.391) -- both real, large improvements, neither clearing 0.6. This is an honest,
+  partial result, not a fix that flips the Gate: the fixed ~40ms-per-request stall this addressed was
+  large enough to dominate the *first* run's numbers, but the remaining gap is the same single-OS-
+  thread queueing cost this phase's own Root cause analysis above already identified -- fixing that
+  for real still means the multi-worker/multi-threaded redesign already flagged as out of scope here.
+
 ## Dependency order
 
 Phases 0-4 are strictly sequential (each is the substrate for the next). 5, 6, 7, 8 can happen in
