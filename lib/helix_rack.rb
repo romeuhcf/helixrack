@@ -8,6 +8,45 @@ require "helix_rack/helix_rack"
 module HelixRack
   class Error < StandardError; end
 
+  # Guards [`install_shutdown_traps`]/[`restore_shutdown_traps`] against a
+  # real correctness bug a CodeRabbit finding on this PR traced through
+  # them: if two `HelixRack.serve` calls ever overlap in one process (an
+  # unusual but not forbidden usage pattern -- e.g. two servers on different
+  # ports, each on its own thread), each installs traps and, without this
+  # guard, would unconditionally restore whatever it saw as "previous" once
+  # its own `_serve_native` call returns. If the *first* call to finish
+  # happened to have started *before* the second (so its "previous" is the
+  # pre-HelixRack handler, not the second call's), that's fine -- but if the
+  # first call to *finish* is actually the *second* one to have *started*
+  # (started after the first, so it captured the first's still-active trap
+  # as its own "previous"), restoring that "previous" would silently
+  # overwrite the *first* call's still-running trap with its own,
+  # disconnecting the still-running first server from `SIGTERM`/`SIGINT` for
+  # the rest of its life, with nothing visibly wrong until a signal that
+  # should have reached it doesn't.
+  #
+  # An early version of this fix rejected any overlapping `HelixRack.serve`
+  # call outright -- simpler, but it surfaced an unrelated, pre-existing
+  # race in this project's own same-process test harnesses
+  # (`spec/support/phase{2,5,6}_server_helper.rb`'s `ensure { server_thread&.kill }`,
+  # which sends `Thread#kill` but never `Thread#join`s it, so the *next*
+  # example's own `HelixRack.serve` call can legitimately start before the
+  # previous example's killed thread has finished unwinding and running its
+  # own `ensure` blocks) -- confirmed by that fix making otherwise-unrelated
+  # Phase 2/6 examples flake with "already running", not a real
+  # double-`serve` bug. A generation counter instead: each
+  # `install_shutdown_traps` call gets the next generation number, and
+  # `restore_shutdown_traps` only actually restores if its generation is
+  # still the *current* one -- i.e. if no *later* `install_shutdown_traps`
+  # call has happened since. If a later call has taken over, this one's
+  # "previous" is stale by definition (restoring it would be exactly the
+  # clobbering bug above) and is safely skipped -- the newer call's own trap
+  # (or whatever it itself later restores) is left in place instead. This
+  # fixes the same bug without rejecting anything or needing every call site
+  # of `HelixRack.serve` to be mutually exclusive.
+  @trap_generation_mutex = Mutex.new
+  @trap_generation = 0
+
   # Phase 2 entry point (see `PLAN.md` at the repo root, Phase 2): start a
   # HelixRack server bound to `bind`:`port`, serving `app` (a Rack app
   # responding to `#call(env)`).
@@ -55,6 +94,10 @@ module HelixRack
   # call. `install_shutdown_traps` now chains to whatever was registered
   # before it, so an embedder's own `SIGTERM` cleanup (closing a DB pool,
   # say) still runs.
+  #
+  # See `@trap_generation_mutex`'s own doc comment (top of this file) for
+  # how overlapping `HelixRack.serve` calls in one process are handled
+  # safely without being rejected.
   # rubocop:disable Metrics/ParameterLists -- one keyword argument per
   # PRD.md section 6.2 CLI flag (mirroring `exe/helix_rack`'s `parser.on`
   # clauses one for one), plus the two positional Rack-required arguments
@@ -67,18 +110,18 @@ module HelixRack
     grace_period_seconds: 30
   )
     # Reset *before* installing this call's own traps -- see
-    # `ext/helix_rack/src/lib.rs`'s `reset_shutdown_request` doc comment for
-    # the safety-review finding on why that ordering (not resetting from
-    # inside `_serve_native`, after the traps were already armed) is the one
-    # that actually closes the race, not just moves it.
+    # `ext/helix_rack/src/lib.rs`'s `reset_shutdown_request` doc comment
+    # for the safety-review finding on why that ordering (not resetting
+    # from inside `_serve_native`, after the traps were already armed) is
+    # the one that actually closes the race, not just moves it.
     _reset_shutdown_request
-    previous_traps = install_shutdown_traps
+    generation, previous_traps = install_shutdown_traps
     begin
       _serve_native(
         app, port, bind, keep_alive_timeout, max_keepalive, cpu_time_slice_ms, grace_period_seconds
       )
     ensure
-      restore_shutdown_traps(previous_traps)
+      restore_shutdown_traps(generation, previous_traps)
     end
   end
   # rubocop:enable Metrics/ParameterLists
@@ -96,14 +139,16 @@ module HelixRack
   # sets a flag `cancelled` polls independently, so this doesn't depend on
   # that unblock function firing at all for the signal case.
   #
-  # Captures and returns each signal's *previous* handler (`Signal.trap`'s
-  # own return value -- a `Proc`, or a string like `"DEFAULT"`/`"IGNORE"` if
-  # nothing custom was registered) so [`restore_shutdown_traps`] can put it
-  # back once this `HelixRack.serve` call ends, and so this trap chains to
-  # it (if it responds to `#call`) after doing its own work -- an embedder's
-  # own signal handling, registered before calling `HelixRack.serve`, still
-  # runs; see this constant's -- `serve`'s -- own doc comment for why that
-  # matters.
+  # Captures and returns `[generation, previous_traps]` -- `generation`
+  # from `@trap_generation_mutex` (see its own doc comment for what it's
+  # for), and `previous_traps` each signal's *previous* handler
+  # (`Signal.trap`'s own return value -- a `Proc`, or a string like
+  # `"DEFAULT"`/`"IGNORE"` if nothing custom was registered) so
+  # [`restore_shutdown_traps`] can put it back once this `HelixRack.serve`
+  # call ends, and so this trap chains to it (if it responds to `#call`)
+  # after doing its own work -- an embedder's own signal handling,
+  # registered before calling `HelixRack.serve`, still runs; see this
+  # constant's -- `serve`'s -- own doc comment for why that matters.
   #
   # `_request_shutdown` itself is documented (in Rust) as trivial and
   # panic-free, safe to call from a trap context. `warn` and the chained
@@ -115,9 +160,15 @@ module HelixRack
   # turn a real signal into an uncaught exception landing at some arbitrary
   # point on the main thread instead of the clean shutdown this exists for.
   def self.install_shutdown_traps
-    %w[TERM INT].each_with_object({}) do |signal, previous|
-      previous_handler = Signal.trap(signal) { handle_shutdown_signal(signal, previous_handler) }
-      previous[signal] = previous_handler
+    @trap_generation_mutex.synchronize do
+      generation = @trap_generation += 1
+      previous_traps = %w[TERM INT].each_with_object({}) do |signal, previous|
+        previous_handler = Signal.trap(signal) do |signo|
+          handle_shutdown_signal(signal, signo, previous_handler)
+        end
+        previous[signal] = previous_handler
+      end
+      [generation, previous_traps]
     end
   end
   private_class_method :install_shutdown_traps
@@ -126,11 +177,21 @@ module HelixRack
   # method stays short -- see its own doc comment for why each step here
   # (the native call, the log line, the chain to whatever handler was
   # registered before this one) is independently rescued.
+  #
+  # `signo` (the signal number `Signal.trap` passes its block, confirmed
+  # live on this Ruby version, not assumed) is forwarded to
+  # `previous_handler.call` -- a CodeRabbit finding on this PR caught that
+  # calling it with no arguments works for a lenient `Proc` (registered via
+  # `Signal.trap(sig) { ... }`, the common case) but raises `ArgumentError`
+  # for a strict callable (a lambda, or a `Method` object) expecting the
+  # same argument `Signal.trap` itself would have passed it directly -- and
+  # the rescue below would have silently swallowed that `ArgumentError`
+  # rather than actually running the chained handler's real behavior.
   # rubocop:disable Metrics/MethodLength -- two deliberately separate
   # `begin`/`rescue` blocks (see this method's own doc comment for why one
   # raising must not stop the other from running), not something to merge
   # for a line-count target.
-  def self.handle_shutdown_signal(signal, previous_handler)
+  def self.handle_shutdown_signal(signal, signo, previous_handler)
     _request_shutdown
     begin
       warn "[helix_rack] received SIG#{signal}, shutting down"
@@ -138,7 +199,7 @@ module HelixRack
       nil
     end
     begin
-      previous_handler.call if previous_handler.respond_to?(:call)
+      previous_handler.call(signo) if previous_handler.respond_to?(:call)
     rescue StandardError
       nil
     end
@@ -150,8 +211,18 @@ module HelixRack
   # each signal in `previous_traps` (from [`install_shutdown_traps`]) --
   # called from `serve`'s `ensure`, so this runs whether `_serve_native`
   # returned normally or raised.
-  def self.restore_shutdown_traps(previous_traps)
-    previous_traps.each { |signal, handler| Signal.trap(signal, handler) }
+  #
+  # Only if `generation` is still the *current* one -- see
+  # `@trap_generation_mutex`'s own doc comment (top of this file) for why a
+  # stale generation must skip restoring rather than blindly doing it: a
+  # later, still-running `HelixRack.serve` call's own trap would otherwise
+  # get silently overwritten by this now-outdated "previous" state.
+  def self.restore_shutdown_traps(generation, previous_traps)
+    @trap_generation_mutex.synchronize do
+      return unless generation == @trap_generation
+
+      previous_traps.each { |signal, handler| Signal.trap(signal, handler) }
+    end
   end
   private_class_method :restore_shutdown_traps
 

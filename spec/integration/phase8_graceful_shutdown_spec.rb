@@ -24,6 +24,25 @@ require_relative "../support/phase8_server_helper"
 # doc comment), and (b)/(c) are bounded polls/timeouts, not fixed-duration
 # guesses.
 #
+# What this does **not** prove, flagged by a CodeRabbit finding on this PR
+# and left as a known, narrowed claim rather than forced into a fragile
+# fix: because the barrier is released immediately after `Process.kill`,
+# this example can't pin down whether the response arriving intact is
+# actually `ConnectionCounter::drain` waiting for it, versus the request
+# simply finishing on its own before shutdown's `select!` even gets a
+# chance to resolve (which, per the architecture note above, can only
+# happen once this same in-flight request has already finished anyway) --
+# a server with `drain` deleted outright could plausibly still pass this
+# specific example. `drain`'s own real effect (an idle keep-alive
+# connection with nothing in flight must *not* make shutdown wait, while a
+# connection with an in-flight response still writing must) was verified
+# separately, manually, against the compiled binary (see `PLAN.md`'s Phase 8
+# Resolution note, safety-review finding 1) rather than folded into this
+# gate -- reproducing that distinction here deterministically would need a
+# response large/slow enough to create a real, reliably-hittable
+# write-in-progress window, which this gate's tiny fixture body does not
+# provide.
+#
 # Why not PLAN.md's original ordering (send SIGTERM, assert refusal
 # *before* releasing the barrier): this runtime is single-OS-thread (PRD.md
 # RNF01, already the reason Phase 5's own gate can't claim two connections

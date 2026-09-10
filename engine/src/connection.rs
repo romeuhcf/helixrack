@@ -85,14 +85,19 @@ const MAX_HEADERS: usize = 64;
 /// RAII guard around one request's [`ConnectionCounter::record_request_start`]/
 /// [`record_request_finish`](ConnectionCounter::record_request_finish) pair
 /// (Phase 8, `PLAN.md`, Phase 8/RNF05). `handle`'s loop below constructs one
-/// right before `Handler::call` and explicitly `drop`s it right after the
-/// response is fully written -- the RAII part is what guarantees
+/// as soon as a request's headers are fully parsed -- *before* buffering its
+/// body, not just before `Handler::call` (a CodeRabbit finding on the
+/// original PR caught that a slow client's still-arriving body, or the
+/// 413/400 rejection responses generated while buffering it, weren't being
+/// counted as in-flight at all) -- and explicitly `drop`s it right after the
+/// response is fully written. The RAII part is what guarantees
 /// `record_request_finish` still runs on every early-return-via-`?` path in
-/// between (`ensure_framing`, either `write_all`/`write_body` call failing),
-/// not just the success path; without it, a write error on the response for
-/// a request already counted as in-flight would leak it as permanently
-/// in-flight, and a graceful shutdown's `ConnectionCounter::drain` would
-/// wait out its full `grace_period` for a connection that already died.
+/// between (body-buffering I/O errors, `ensure_framing`, either
+/// `write_all`/`write_body` call failing), not just the success path;
+/// without it, a failure partway through a request already counted as
+/// in-flight would leak it as permanently in-flight, and a graceful
+/// shutdown's `ConnectionCounter::drain` would wait out its full
+/// `grace_period` for a connection that already died.
 struct InFlightGuard<'a> {
     connections: &'a ConnectionCounter,
 }
@@ -192,6 +197,22 @@ pub(crate) async fn handle(
                 }
             };
 
+            // RAII, constructed as soon as headers are complete -- *before*
+            // body buffering, not just before `Handler::call` -- so a
+            // graceful shutdown's `drain` also waits out a request whose
+            // body is still trickling in over the wire, and the 413/400
+            // rejection responses just below (both real responses that must
+            // finish writing before this connection is safe to drop), not
+            // only the `Handler::call` path. A CodeRabbit finding on this
+            // PR caught the original placement (just before `Handler::call`,
+            // after body buffering) as a real, if narrow, gap: `drain`
+            // could observe zero in-flight requests and let a shutdown tear
+            // this connection down while still waiting on a slow client's
+            // body bytes. See this loop's other `InFlightGuard` comment,
+            // further down, for why RAII (not a manual call at the bottom)
+            // still matters here regardless of where construction starts.
+            let in_flight = InFlightGuard::new(&connections);
+
             // Reject an oversized declared body *before* attempting to
             // allocate for it -- see `MAX_BODY_CAPACITY`'s doc comment.
             if body_len > MAX_BODY_CAPACITY {
@@ -264,18 +285,18 @@ pub(crate) async fn handle(
             // if this function is ever restructured.
             let is_head = parsed_request.method.eq_ignore_ascii_case("HEAD");
 
-            // RAII, not a manual `record_request_finish()` call at the
-            // bottom of this block: several steps between here and the
-            // response being fully written can return early via `?`
+            // `in_flight` (constructed above, right after headers were
+            // parsed) is RAII, not a manual `record_request_finish()` call
+            // at the bottom of this block: several steps between here and
+            // the response being fully written can return early via `?`
             // (`ensure_framing`, both `write_all`/`write_body` calls) --
             // without a guard, any of those would leak this request as
             // permanently "in flight", starving `ConnectionCounter::drain`
             // of ever seeing it finish. Explicitly `drop`ped right after
             // the response write completes (success or error), not left to
             // the end of this loop iteration's scope, so the "in flight"
-            // window is exactly "handler running through response written",
+            // window is exactly "headers parsed through response written",
             // matching what `drain` actually needs to wait for.
-            let in_flight = InFlightGuard::new(&connections);
             let mut response = handler.call(&parsed_request);
 
             // The engine is the sole source of truth for the `Connection`

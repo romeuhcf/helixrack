@@ -526,13 +526,13 @@ for a real, verified architectural reason, not a convenience.
   magnus-registered function call from Ruby code that (confirmed, every test run) always does run
   promptly even in the exact window where the unblock-function path was shown to break. `cancelled`
   now resolves on *either* `cancel` (still correct and exercised for `Thread#kill`, never observed to
-  have this failure mode) or `SHUTDOWN_REQUESTED` becoming true. `SHUTDOWN_REQUESTED` is reset at the
-  top of `_serve_native` (it is a `static`, unlike `cancel`, which is freshly allocated per call) so a
-  same-process test harness booting several servers in a row doesn't see a stale flag from an earlier
-  run's signal immediately cancel the next one — leaving a small, deliberately-accepted residual race
-  (a signal landing in the narrow window between that reset and the accept loop actually starting),
-  the same shape as the watchdog-thread-leak gap this file's Phase 6 Resolution note already accepted
-  rather than claimed fully closed.
+  have this failure mode) or `SHUTDOWN_REQUESTED` becoming true. `SHUTDOWN_REQUESTED` is a `static`
+  (unlike `cancel`, which is freshly allocated per call), so a same-process test harness booting
+  several servers in a row needs it reset between runs, or a stale flag from an earlier run's signal
+  would immediately cancel the next one — see the safety-review findings below for exactly where that
+  reset runs and why (an earlier version of this note described resetting from inside
+  `_serve_native`, which a later safety-review pass found was itself the wrong place, for a reason
+  worth reading there rather than re-described here twice).
 - Re-verified after the fix: the corrected gate (release barrier, then assert refusal) passed
   consistently in under half a second across five consecutive runs, down from never resolving at all
   within a 90-second budget beforehand — not a marginal improvement, a correctness fix.
@@ -593,6 +593,21 @@ for a real, verified architectural reason, not a convenience.
   5. **(Low) `spec/support/phase8_server_helper.rb`'s force-kill reap had no timeout**, unlike Phase
      7's equivalent helper. Fixed to match Phase 7's `Timeout.timeout`-bounded `wait_for_exit`
      pattern rather than a bare `Process.waitpid`.
+  6. **(Major, left as a narrowed claim, not forced into a fragile fix) the gate's own proof
+     strength for `drain` itself is weaker than it looks.** Because the fixture's barrier is released
+     immediately after `Process.kill`, the gate can't distinguish "the response arrived intact
+     because `drain` waited for it" from "the request simply finished on its own before shutdown's
+     `select!` even had a chance to resolve" (which, per the architecture note above, can only happen
+     once that same in-flight request has already finished anyway) — a server with `drain` deleted
+     outright could plausibly still pass this specific example. `drain`'s own real effect was verified
+     separately and directly instead (safety-review finding 1's own reproduction: an idle keep-alive
+     connection with nothing in flight must not make shutdown wait, while a connection with a response
+     still being written must), not folded into this gate — doing so deterministically would need a
+     response large/slow enough to create a real, reliably-hittable write-in-progress window, which
+     this gate's tiny fixture body doesn't provide. Narrowing the gate's own doc comment to state this
+     explicitly, per CodeRabbit's own suggested fallback ("if this architecture cannot create that
+     state, limit this gate's claim"), rather than building new test infrastructure under time
+     pressure for a window that may not even be reliably hittable on this architecture.
 
 ## Phase 9 — I/O backend parity (io_uring / epoll fallback)
 
