@@ -215,6 +215,15 @@ pub(crate) async fn handle(
                 body: &buf[consumed..body_end],
             };
 
+            // Captured as an owned `bool` now, before `handler.call` below
+            // (which only needs a borrow of `parsed_request` for its own
+            // duration) -- read again at the body-write step further down,
+            // where a borrow of `parsed_request.method` would otherwise
+            // still be valid too (`buf` isn't mutated in between), but an
+            // owned `bool` makes that independent of that fact staying true
+            // if this function is ever restructured.
+            let is_head = parsed_request.method.eq_ignore_ascii_case("HEAD");
+
             let mut response = handler.call(&parsed_request);
 
             // The engine is the sole source of truth for the `Connection`
@@ -252,7 +261,22 @@ pub(crate) async fn handle(
 
             let head = serialize_head(&response);
             socket.write_all(&head).await?;
-            write_body(&mut socket, &response.body).await?;
+            // HTTP/1.1 (RFC 9110 section 9.3.2): a response to `HEAD` must
+            // carry the same header fields a `GET` would (so `ensure_framing`
+            // above still ran, and `Content-Length` above still reflects the
+            // body's real length) but must never send the body itself.
+            // Found by this phase's own safety review, corroborated
+            // independently by CodeRabbit on the same PR: before this,
+            // `write_body` ran unconditionally, so a `HEAD` response with any
+            // non-empty body (previously only reachable via a handler that
+            // deliberately returned one for `HEAD`; now also reachable via
+            // `ext/helix_rack`'s Phase 7 fault-containment `500` body) wrote
+            // bytes the client doesn't expect there, which the client then
+            // misreads as the start of the *next* response on the same
+            // persistent connection -- silent desync, not a clean error.
+            if !is_head {
+                write_body(&mut socket, &response.body).await?;
+            }
 
             if is_last_allowed_request {
                 // This was the max_keepalive-th request: the response just

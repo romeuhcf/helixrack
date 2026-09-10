@@ -446,16 +446,23 @@ the very next unrelated request still succeeds with `200`. All three are exact a
   real stderr to a file instead of discarding it (`File::NULL`), and the gate spec now asserts each
   row's `log_fault` output too (`"request handler panicked"` for the panic row, `"request failed"` for
   the other two) — the response alone is no longer treated as sufficient proof.
-- **One safety-review finding left deferred, not fixed here, because it's a pre-existing gap in
-  `engine::connection`, not something this phase introduced:** `connection::handle` never
-  special-cases `HEAD` requests — it writes a response's body unconditionally regardless of method —
-  so a `HEAD` request that hits `error_response()`'s new 22-byte body (where the pre-Phase-7 error
-  path returned an empty one) now writes bytes a `HEAD` response must not carry, desyncing keep-alive
-  framing for the next request on that connection. This diff is what makes the ext's own error path
-  reach that gap, but the gap itself is general (any `HEAD` request to any handler with a non-empty
-  body hits it, not just the fault path) and belongs in `connection::handle`, not here — flagged for
-  Phase 11 (Rack compliance), whose `Rack::Lint` suite should catch a `HEAD` response carrying a body
-  if this hasn't been fixed by then.
+- **One finding, originally deferred, fixed instead after CodeRabbit flagged it independently as
+  Major on the same PR:** `engine::connection::handle` never special-cased `HEAD` requests — it wrote
+  a response's body unconditionally regardless of method — so a `HEAD` request that hit
+  `error_response()`'s new 22-byte body (where the pre-Phase-7 error path returned an empty one) wrote
+  bytes a `HEAD` response must not carry (RFC 9110 section 9.3.2), desyncing keep-alive framing for
+  the next request on that connection. The gap itself is general (any `HEAD` request to any handler
+  with a non-empty body hits it, not just the fault path) and this diff is only what made it easy to
+  hit in practice, not its root cause — genuinely `connection::handle`'s to fix, and this Resolution
+  note first said so, deferring it to Phase 11. Fixed here anyway once a second, independent reviewer
+  (CodeRabbit) flagged the same gap unprompted and called it Major: two independent findings on one
+  contained, well-understood bug outweighed the "narrowed scope" argument for leaving it. The fix
+  (`connection::handle`): keep `ensure_framing`'s `Content-Length` computation unchanged, skip the
+  `write_body` call for `HEAD`. New regression test,
+  `engine/tests/head_request_body_suppression.rs`, sends a `HEAD` request that would carry a non-empty
+  body followed by a `GET` on the *same* connection — the second response only comes back byte-exact
+  if the first one didn't desync the connection, which is the actual failure mode this bug produces,
+  not just "the HEAD response looked wrong in isolation".
 
 ## Phase 8 — Graceful shutdown (RNF05)
 
@@ -502,13 +509,6 @@ serialization) served through HelixRack.
 
 **Gate:** the official Rack::Lint suite green; a request-spec table (route x params x expected
 status/JSON body) asserted exactly, one row per scenario from PRD section 7.1.
-
-**Known incoming gap (Phase 7's safety review, deferred here):** `engine::connection::handle` never
-special-cases `HEAD` — it writes a response's body unconditionally regardless of request method, so
-any `HEAD` request to a handler with a non-empty body gets one anyway, desyncing keep-alive framing
-for the connection's next request. `Rack::Lint` should flag a `HEAD` response carrying a body; if it
-doesn't (or this hasn't been fixed by the time this phase starts), add an explicit assertion for it
-rather than relying on Rack::Lint to catch it incidentally.
 
 ## Phase 12 — Packaging
 
