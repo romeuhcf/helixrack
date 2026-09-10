@@ -479,11 +479,135 @@ them the instant `cancel` flips.
 
 **Deliverable:** clean shutdown behavior under Kubernetes-style termination.
 
-**Gate:** spawn the server as a subprocess. Open a connection whose request blocks on a barrier
-(same technique as Phase 5, not `sleep`). Send SIGTERM. Assert, in order: (1) a **new** connection
-attempt is refused immediately, (2) releasing the barrier lets the in-flight request's response
-arrive intact, (3) the process exits with code 0 within `grace_period + epsilon`. All
-boolean/bounded assertions.
+**Gate (as originally written):** spawn the server as a subprocess. Open a connection whose request
+blocks on a barrier (same technique as Phase 5, not `sleep`). Send SIGTERM. Assert, in order: (1) a
+**new** connection attempt is refused immediately, (2) releasing the barrier lets the in-flight
+request's response arrive intact, (3) the process exits with code 0 within `grace_period + epsilon`.
+All boolean/bounded assertions. **See "Resolution" below — the actual gate reorders (1) and (2)**,
+for a real, verified architectural reason, not a convenience.
+
+**Resolution:**
+
+- **Architecture note, discovered by this phase, not assumed going in:** this runtime is
+  single-OS-thread (PRD.md RNF01) and `Handler::call` (`RackAppHandler`, `ext/helix_rack/src/lib.rs`)
+  is a plain synchronous Rust function with no `.await` point in it — so while *any* connection's
+  handler is executing, the entire Tokio reactor (accept loop included) cannot make progress on
+  anything else, full stop, regardless of what triggered a desire to. This is the same tradeoff
+  Phase 5's own gate already documents for concurrent request handling ("not a claim that a second
+  HTTP connection gets served concurrently"); Phase 8 is where its consequence for *shutdown*
+  specifically became unavoidable to confront. Practical result: "stop accepting new connections"
+  cannot be instantaneous relative to the exact moment a signal arrives while a request is already
+  in flight — it only becomes possible again once that one in-flight `Handler::call` returns. The
+  gate's own ordering was corrected to match this reality: release the barrier *first*, then assert
+  refusal, not the other way around — PLAN.md's original ordering asked for something this
+  architecture cannot do, and that is the gate's error to fix, not a bug to work around.
+- **A second, more serious finding, verified with a 90-second total-silence measurement, not
+  assumed:** the originally-planned cancellation mechanism (racing `serve` against a `cancel`
+  `AtomicBool` flipped only by `rb_thread_call_without_gvl`'s own unblock function, the same
+  mechanism `Thread#kill` already used for `spec/support/phase*_server_helper.rb`'s test harnesses)
+  is not just slow but can become **permanently** unreliable for a real signal: if `SIGTERM` arrives
+  while a handler is blocked inside *nested* Ruby-level blocking I/O (this phase's fixture's
+  `TCPSocket#read`, itself internally GVL-releasing, invoked from inside this crate's own
+  `gvl::with_gvl` reacquisition, itself inside the outer `gvl::without_gvl` span the unblock function
+  is registered against), `cancel` can fail to ever flip — confirmed by sending `SIGTERM` in exactly
+  that window, then leaving the process completely idle (no further requests, no polling at all) for
+  90 full seconds: it never flipped once. Two control experiments — `SIGTERM` sent after handling one
+  *fast* request first, and one sent after a request that merely `sleep`s (also GVL-releasing, but not
+  nested Ruby I/O) — resolved promptly and reliably every time, ruling out "any prior GVL release" or
+  general system load as the cause; the specific nested-I/O-at-signal-time window is what reproduces
+  it. The precise MRI-internal mechanism was not fully root-caused (a plausible, unconfirmed
+  candidate: the inner blocking read's own separately-registered unblock function never yields the
+  "active for signal delivery" slot back to the outer one once it returns) — this note states what
+  was *measured*, not a confirmed CRuby-internals explanation.
+- **The fix, not a workaround for the above:** stop depending on the unblock-function path for the
+  signal case at all. A new process-global `SHUTDOWN_REQUESTED` flag (`ext/helix_rack/src/lib.rs`) is
+  set directly by a new `HelixRack._request_shutdown` native function, called from the
+  `SIGTERM`/`SIGINT` trap `lib/helix_rack.rb`'s `install_shutdown_traps` installs — a plain
+  magnus-registered function call from Ruby code that (confirmed, every test run) always does run
+  promptly even in the exact window where the unblock-function path was shown to break. `cancelled`
+  now resolves on *either* `cancel` (still correct and exercised for `Thread#kill`, never observed to
+  have this failure mode) or `SHUTDOWN_REQUESTED` becoming true. `SHUTDOWN_REQUESTED` is a `static`
+  (unlike `cancel`, which is freshly allocated per call), so a same-process test harness booting
+  several servers in a row needs it reset between runs, or a stale flag from an earlier run's signal
+  would immediately cancel the next one — see the safety-review findings below for exactly where that
+  reset runs and why (an earlier version of this note described resetting from inside
+  `_serve_native`, which a later safety-review pass found was itself the wrong place, for a reason
+  worth reading there rather than re-described here twice).
+- Re-verified after the fix: the corrected gate (release barrier, then assert refusal) passed
+  consistently in under half a second across five consecutive runs, down from never resolving at all
+  within a 90-second budget beforehand — not a marginal improvement, a correctness fix.
+- `--grace-period`/`grace_period_seconds` (PRD.md section 6.2, default 30s, matching Kubernetes'
+  `terminationGracePeriodSeconds` default) only bounds the *drain* step once shutdown is noticed —
+  the architecture-note latency above (bounded by whatever's already in flight when the signal
+  arrives) is additional, separate time on top of it, not counted against it. Operators sizing this
+  flag should budget for that.
+- **A dedicated safety-review pass on this whole diff found and fixed five further issues,** most
+  severe first:
+  1. **(Medium-High) `drain` was scoped to open connections, not in-flight requests** — measured
+     concretely, not theorized: one fast request over a connection left open afterward (an ordinary
+     keep-alive idle period, not a bug in the client) pushed a full shutdown from ~0.02s to the
+     entire configured `grace_period` (8s in the reproduction, would be the full 30s default in
+     production) — a keep-alive connection with nothing in flight on it was still counted as
+     "active" until `keep_alive_timeout` or client disconnect. With PRD.md's own defaults (grace
+     period 30s, matching Kubernetes' own `terminationGracePeriodSeconds`), this is the *normal*
+     production shape (an ingress holding keep-alive connections open), not an edge case — the
+     graceful path would have effectively never completed before `SIGKILL`. Fixed by rescoping
+     `ConnectionCounter` to count in-flight *requests* (bracketed by a new RAII `InFlightGuard` in
+     `engine/src/connection.rs`, covering `Handler::call` through the response being fully written,
+     guaranteed to decrement even on an early-return-via-`?` write error) rather than open
+     connections — an idle connection between requests is safe to drop once `drain` returns and the
+     `LocalSet` tears down (it's parked on a plain `.await`'d read, nothing to clean up). Re-verified:
+     the same reproduction now exits in ~0.01s.
+  2. **(Medium) `warn` inside the shutdown trap could itself raise, turning a graceful shutdown into
+     a non-graceful one** — confirmed live, not assumed: with `$stderr` replaced by something whose
+     `write` uses a `Mutex` (an ordinary thing for an embedding app's own logger to do), `warn`
+     inside a trap context raised `ThreadError: can't be called from trap context`, and that
+     exception surfaced at an arbitrary point on the main thread — inside the very request `drain`
+     was waiting on, in one reproduction. Fixed by rescuing `StandardError` around the `warn` call
+     (and, once added, around the chained previous-handler call in finding 4, independently, so one
+     raising doesn't stop the other).
+  3. **(Medium) The `SHUTDOWN_REQUESTED` reset's own documentation had the race backwards** — the
+     original version reset the flag from inside `_serve_native`, *after* `install_shutdown_traps`
+     had already armed the traps in `HelixRack.serve`, and its own comment worried about a signal
+     landing *after* that reset. Direct tracing of the actual code path found the real, silent gap
+     ran the *other* direction: a signal landing between trap installation and the (later) reset
+     had its effect immediately erased by that reset, with no trace and no delayed retry needed — a
+     second signal was required to notice anything. Worse for a background-thread caller (this
+     project's own same-process test harnesses included, `spec/support/phase{2,5,6}_server_helper.rb`)
+     than a same-thread analysis suggests: MRI runs trap bodies on the *main* thread regardless of
+     which thread called `HelixRack.serve`, making this a genuine cross-thread race, not a
+     same-thread instruction gap. Fixed by moving the reset to run *before* `install_shutdown_traps`
+     (a new `HelixRack._reset_shutdown_request`, called first thing in `HelixRack.serve`) instead of
+     after, and removing the old reset from `_serve_native` entirely.
+  4. **(Low) The shutdown traps were permanent and unchainable** — `Signal.trap` discards whatever
+     handler was registered before it, with no way for an embedder to run their own `SIGTERM`
+     cleanup (closing a DB pool, say); and the trap `HelixRack.serve` installed was never removed,
+     confirmed to still be active (`Signal.trap` round-tripped a real `Proc`) even after the
+     `HelixRack.serve` call itself had ended — in this repo's own test suite, that meant `Ctrl-C` on
+     the RSpec process stopped working the instant any Phase 2/5/6 example had run. Fixed:
+     `install_shutdown_traps` now captures and chains to each signal's previous handler (if it
+     responds to `#call`), and `HelixRack.serve` restores the original handler in an `ensure` around
+     `_serve_native` once it returns. Re-verified live: a previously-registered trap's block runs
+     when `HelixRack.serve`'s own trap fires, and the original trap is back in place once `serve`
+     returns.
+  5. **(Low) `spec/support/phase8_server_helper.rb`'s force-kill reap had no timeout**, unlike Phase
+     7's equivalent helper. Fixed to match Phase 7's `Timeout.timeout`-bounded `wait_for_exit`
+     pattern rather than a bare `Process.waitpid`.
+  6. **(Major, left as a narrowed claim, not forced into a fragile fix) the gate's own proof
+     strength for `drain` itself is weaker than it looks.** Because the fixture's barrier is released
+     immediately after `Process.kill`, the gate can't distinguish "the response arrived intact
+     because `drain` waited for it" from "the request simply finished on its own before shutdown's
+     `select!` even had a chance to resolve" (which, per the architecture note above, can only happen
+     once that same in-flight request has already finished anyway) — a server with `drain` deleted
+     outright could plausibly still pass this specific example. `drain`'s own real effect was verified
+     separately and directly instead (safety-review finding 1's own reproduction: an idle keep-alive
+     connection with nothing in flight must not make shutdown wait, while a connection with a response
+     still being written must), not folded into this gate — doing so deterministically would need a
+     response large/slow enough to create a real, reliably-hittable write-in-progress window, which
+     this gate's tiny fixture body doesn't provide. Narrowing the gate's own doc comment to state this
+     explicitly, per CodeRabbit's own suggested fallback ("if this architecture cannot create that
+     state, limit this gate's claim"), rather than building new test infrastructure under time
+     pressure for a window that may not even be reliably hittable on this architecture.
 
 ## Phase 9 — I/O backend parity (io_uring / epoll fallback)
 

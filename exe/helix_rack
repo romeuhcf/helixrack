@@ -6,14 +6,16 @@ require "rack"
 require "helix_rack"
 
 # PRD.md section 6.2's CLI flags (-a/-p/-b from Phase 2, --keep-alive-timeout/
-# --max-keepalive from Phase 4, --cpu-time-slice from Phase 6).
+# --max-keepalive from Phase 4, --cpu-time-slice from Phase 6, --grace-period
+# from Phase 8).
 options = {
   app: "config.ru",
   port: 8080,
   bind: "0.0.0.0",
   keep_alive_timeout: 15,
   max_keepalive: 10_000,
-  cpu_time_slice_ms: 5
+  cpu_time_slice_ms: 5,
+  grace_period_seconds: 30
 }
 
 # rubocop:disable Metrics/BlockLength -- one `parser.on` clause per PRD.md
@@ -50,6 +52,12 @@ OptionParser.new do |parser|
   ) do |v|
     options[:cpu_time_slice_ms] = v
   end
+  parser.on(
+    "--grace-period SECONDS", Integer,
+    "How long to wait for active requests to finish after SIGTERM/SIGINT (default: 30)"
+  ) do |v|
+    options[:grace_period_seconds] = v
+  end
 end.parse!(ARGV)
 # rubocop:enable Metrics/BlockLength
 
@@ -59,5 +67,6 @@ HelixRack.serve(
   bind: options[:bind],
   keep_alive_timeout: options[:keep_alive_timeout],
   max_keepalive: options[:max_keepalive],
-  cpu_time_slice_ms: options[:cpu_time_slice_ms]
+  cpu_time_slice_ms: options[:cpu_time_slice_ms],
+  grace_period_seconds: options[:grace_period_seconds]
 )

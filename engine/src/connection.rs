@@ -25,12 +25,14 @@
 
 use std::io;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::handler::{Handler, HandlerResponse, ParsedRequest, ResponseBody};
+use crate::ConnectionCounter;
 
 /// Initial size of the per-connection read buffer. Doubled if a request's
 /// headers don't fit yet -- Phase 1's fixtures are all well under this.
@@ -80,6 +82,39 @@ const BAD_REQUEST_RESPONSE: &[u8] = b"HTTP/1.1 400 Bad Request\r\nConnection: cl
 /// Maximum number of headers `httparse` parses per request.
 const MAX_HEADERS: usize = 64;
 
+/// RAII guard around one request's [`ConnectionCounter::record_request_start`]/
+/// [`record_request_finish`](ConnectionCounter::record_request_finish) pair
+/// (Phase 8, `PLAN.md`, Phase 8/RNF05). `handle`'s loop below constructs one
+/// as soon as a request's headers are fully parsed -- *before* buffering its
+/// body, not just before `Handler::call` (a CodeRabbit finding on the
+/// original PR caught that a slow client's still-arriving body, or the
+/// 413/400 rejection responses generated while buffering it, weren't being
+/// counted as in-flight at all) -- and explicitly `drop`s it right after the
+/// response is fully written. The RAII part is what guarantees
+/// `record_request_finish` still runs on every early-return-via-`?` path in
+/// between (body-buffering I/O errors, `ensure_framing`, either
+/// `write_all`/`write_body` call failing), not just the success path;
+/// without it, a failure partway through a request already counted as
+/// in-flight would leak it as permanently in-flight, and a graceful
+/// shutdown's `ConnectionCounter::drain` would wait out its full
+/// `grace_period` for a connection that already died.
+struct InFlightGuard<'a> {
+    connections: &'a ConnectionCounter,
+}
+
+impl<'a> InFlightGuard<'a> {
+    fn new(connections: &'a ConnectionCounter) -> Self {
+        connections.record_request_start();
+        Self { connections }
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.connections.record_request_finish();
+    }
+}
+
 /// Serves one accepted TCP connection: reads and parses HTTP/1.1 requests
 /// off the wire with `httparse`, calls `handler.call` synchronously for
 /// each one, and writes the serialized response, for as long as the client
@@ -116,11 +151,21 @@ const MAX_HEADERS: usize = 64;
 /// elapsed on an idle read), or a read/write/parse error occurs. The caller
 /// (the `serve` accept loop) runs this per connection independently, so one
 /// connection's error doesn't affect others.
+///
+/// `connections` (Phase 8, `PLAN.md`, Phase 8/RNF05): each request's
+/// handling is bracketed with
+/// [`ConnectionCounter::record_request_start`]/[`record_request_finish`]
+/// (just before `handler.call`, just after the response is fully written)
+/// so a graceful shutdown's drain step can wait for in-flight *requests*,
+/// not open connections -- see that type's own doc comment for why that
+/// distinction matters (an idle keep-alive connection between requests is
+/// *not* something `drain` needs to wait for).
 pub(crate) async fn handle(
     mut socket: TcpStream,
     handler: Rc<dyn Handler>,
     max_keepalive: usize,
     keep_alive_timeout: Duration,
+    connections: Arc<ConnectionCounter>,
 ) -> io::Result<()> {
     let mut buf = vec![0u8; INITIAL_BUF_CAPACITY];
     let mut filled = 0usize;
@@ -151,6 +196,22 @@ pub(crate) async fn handle(
                     httparse::Status::Partial => break,
                 }
             };
+
+            // RAII, constructed as soon as headers are complete -- *before*
+            // body buffering, not just before `Handler::call` -- so a
+            // graceful shutdown's `drain` also waits out a request whose
+            // body is still trickling in over the wire, and the 413/400
+            // rejection responses just below (both real responses that must
+            // finish writing before this connection is safe to drop), not
+            // only the `Handler::call` path. A CodeRabbit finding on this
+            // PR caught the original placement (just before `Handler::call`,
+            // after body buffering) as a real, if narrow, gap: `drain`
+            // could observe zero in-flight requests and let a shutdown tear
+            // this connection down while still waiting on a slow client's
+            // body bytes. See this loop's other `InFlightGuard` comment,
+            // further down, for why RAII (not a manual call at the bottom)
+            // still matters here regardless of where construction starts.
+            let in_flight = InFlightGuard::new(&connections);
 
             // Reject an oversized declared body *before* attempting to
             // allocate for it -- see `MAX_BODY_CAPACITY`'s doc comment.
@@ -224,6 +285,18 @@ pub(crate) async fn handle(
             // if this function is ever restructured.
             let is_head = parsed_request.method.eq_ignore_ascii_case("HEAD");
 
+            // `in_flight` (constructed above, right after headers were
+            // parsed) is RAII, not a manual `record_request_finish()` call
+            // at the bottom of this block: several steps between here and
+            // the response being fully written can return early via `?`
+            // (`ensure_framing`, both `write_all`/`write_body` calls) --
+            // without a guard, any of those would leak this request as
+            // permanently "in flight", starving `ConnectionCounter::drain`
+            // of ever seeing it finish. Explicitly `drop`ped right after
+            // the response write completes (success or error), not left to
+            // the end of this loop iteration's scope, so the "in flight"
+            // window is exactly "headers parsed through response written",
+            // matching what `drain` actually needs to wait for.
             let mut response = handler.call(&parsed_request);
 
             // The engine is the sole source of truth for the `Connection`
@@ -277,6 +350,7 @@ pub(crate) async fn handle(
             if !is_head {
                 write_body(&mut socket, &response.body).await?;
             }
+            drop(in_flight);
 
             if is_last_allowed_request {
                 // This was the max_keepalive-th request: the response just

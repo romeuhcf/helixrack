@@ -171,6 +171,7 @@ $ bundle exec helix_rack -a config.ru -p 8080 -o 0.0.0.0 --max-keepalive 10000
 | `--keep-alive-timeout` | Integer | `15` | Timeout em segundos para fechar conexões ociosas. |
 | `--max-keepalive` | Integer | `10000` | Número máximo de requisições por conexão TCP antes do encerramento forçado (`Connection: close`). |
 | `--cpu-time-slice` | Integer | `5` | Limite de tempo (ms) contínuo no Ruby antes da sinalização de pausa. |
+| `--grace-period` | Integer | `30` | Tempo (s) de espera por requisições ativas após SIGTERM/SIGINT antes do encerramento. |
 
 ## 7. Planos de Testes e Validação
 
