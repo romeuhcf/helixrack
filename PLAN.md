@@ -942,8 +942,11 @@ platform list (matching the existing `exclude: ["arm-linux", "x64-mingw32"]` pre
   Rakefile without those requires wouldn't hit this, plausibly why `rake_compiler_dock`'s own documented
   example (`RakeCompilerDock.sh 'bundle && rake cross native gem'`) shows the plain form working. Re-ran
   `bundle exec rake gem:native` and `bundle exec rspec spec/integration/phase12_native_gem_spec.rb` locally
-  after this fix and confirmed both pass; a further CI re-dispatch is what will confirm
-  `verify-native-install` itself now passes end to end.
+  after this fix and confirmed both pass; a third `build-gems.yml` dispatch confirmed `verify-native-install`
+  itself now passes in real CI too, alongside every other platform (`x86_64-linux`, `aarch64-linux`,
+  `aarch64-mingw-ucrt`, `arm64-darwin`, `x86_64-darwin`, `x86_64-linux-musl`, `aarch64-linux-musl`) --
+  `arm-linux-musl` is the only job that still fails, still for Phase 10's already-documented, unrelated
+  reason.
 - **The gate itself is `spec/integration/phase12_native_gem_spec.rb`**, a real `docker run` against a
   plain `ruby:3.4-slim` image (confirmed to have no `gcc`/`cc`/`cargo`/`rustc`/`make`), asserting the exact
   `gem install` exit code, `helix_rack --version`/`--help` output and exit codes, all inside that
