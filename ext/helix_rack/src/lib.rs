@@ -54,7 +54,9 @@ use magnus::prelude::*;
 use magnus::value::Opaque;
 use magnus::{Error, RClass, RHash, RString, Ruby, Value};
 
-use helixrack_engine::{serve, ConnectionCounter, Handler, HandlerResponse, ParsedRequest, ResponseBody};
+use helixrack_engine::{
+    probe_io_backend, serve, ConnectionCounter, Handler, HandlerResponse, ParsedRequest, ResponseBody,
+};
 
 /// Minimal `rb_thread_call_without_gvl`/`rb_thread_call_with_gvl` wrappers
 /// (see this module's top doc comment for why they're here). Neither is
@@ -1641,6 +1643,16 @@ fn reset_shutdown_request() {
     SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
 }
 
+/// `HelixRack._io_backend_probe` -- Phase 9 (`PLAN.md`, Phase 9): relays
+/// `helixrack_engine::probe_io_backend`'s real, syscall-based io_uring
+/// capability check out to Ruby. Diagnostic only, per that function's own
+/// doc comment -- this does not change what `_serve_native`'s accept loop
+/// actually does; it always runs on Tokio's own (epoll, on Linux) reactor
+/// regardless of this value.
+fn io_backend_probe() -> String {
+    probe_io_backend().as_str().to_string()
+}
+
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
     let module = ruby.define_module("HelixRack")?;
@@ -1654,6 +1666,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
         "_reset_shutdown_request",
         magnus::function!(reset_shutdown_request, 0),
     )?;
+    module.define_module_function("_io_backend_probe", magnus::function!(io_backend_probe, 0))?;
     // Phase 6 (`PLAN.md`, Phase 6): pre-registers the postponed job callback
     // exactly once, at extension load time -- see `watchdog::register`'s doc
     // comment for why it belongs here rather than in `_serve_native`.

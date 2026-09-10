@@ -62,6 +62,11 @@ end.parse!(ARGV)
 # rubocop:enable Metrics/BlockLength
 
 app = Rack::Builder.parse_file(options[:app])
+# Phase 9 (PLAN.md, Phase 9): informational only -- see HelixRack.io_backend's
+# own doc comment. Logged once at startup rather than left unqueried; a
+# real, syscall-based capability check is only useful if it's visible.
+warn "[helix_rack] I/O backend detected: #{HelixRack.io_backend} " \
+     "(informational only -- network I/O currently always uses Tokio's own epoll reactor)"
 HelixRack.serve(
   app, options[:port],
   bind: options[:bind],

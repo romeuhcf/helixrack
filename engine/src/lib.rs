@@ -12,6 +12,10 @@
 //! The actual request parsing and response serialization lives in
 //! [`connection`]; this file owns the accept loop and the
 //! [`ConnectionCounter`] the Phase 1 gate (`engine/tests/`) checks.
+//!
+//! [`io_backend`] is a Phase 9 (`PLAN.md`, Phase 9) addition: a diagnostic
+//! io_uring capability probe. It does not change what [`serve`] actually
+//! does -- see that module's own doc comment for why.
 
 use std::io;
 use std::rc::Rc;
@@ -35,8 +39,10 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(10);
 
 mod connection;
 mod handler;
+mod io_backend;
 
 pub use handler::{Handler, HandlerResponse, ParsedRequest, ResponseBody};
+pub use io_backend::{probe as probe_io_backend, IoBackend};
 
 /// Counts how many TCP connections the engine has *accepted* since a given
 /// `serve` call started, and -- since Phase 8 (`PLAN.md`, Phase 8/RNF05) --
