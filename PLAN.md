@@ -986,9 +986,11 @@ gate under a fixed methodology**, not a single deterministic assertion:
   images), `bench/apps/*.ru` (the three PRD.md 7.2 scenarios, described below), `bench/k6/scenario.js`
   (one parameterized k6 script, not three near-duplicates), and `bench/run.rb` (the orchestrator:
   builds the image, boots a Postgres container and seeds it, then for every (server, scenario) pair
-  boots a fresh, resource-limited server container, runs k6 `N_RUNS` times against it, samples the
-  server's cgroup `memory.peak` after each run, computes medians, writes `bench/results/report.md` +
-  `results.json`, and asserts the Gate). Run with `bundle exec rake bench`; not part of `bundle exec
+  runs `N_RUNS` repetitions -- each one booting a *fresh*, resource-limited server container, running
+  one k6 load test against it, sampling the server's cgroup `memory.peak`, then tearing that container
+  down before the next repetition starts (a CodeRabbit finding, see below, for why per-repetition and
+  not one container shared across all `N_RUNS`) -- computes medians, writes `bench/results/report.md`
+  + `results.json`, and asserts the Gate). Run with `bundle exec rake bench`; not part of `bundle exec
   rspec`/`main.yml`'s routine per-PR job (real minutes: an image build plus N=10 x 3 scenarios x 3
   servers real load runs), matching Phase 10/12's established precedent for scoping a heavy, real
   verification to an explicit, on-demand invocation (a new `.github/workflows/bench.yml`,
@@ -1041,27 +1043,63 @@ gate under a fixed methodology**, not a single deterministic assertion:
   180s timeout, not guessed). The numbers below are real, measured, N=10-run-per-cell results from this
   run, on this machine, at this time -- not claimed to be portable to a different machine, exactly the
   caveat this section's own opening paragraph already anticipates.
+- **A mandatory CodeRabbit review pass on the PR carrying this phase's first version found real bugs
+  in the harness itself, fixed before trusting any of its numbers**:
+  1. **`memory.peak` accumulated across repetitions, invalidating the RSS samples.** The first version
+     called `boot_server` once per (server, scenario) pair, then sampled cgroup v2 `memory.peak` after
+     each of the `N_RUNS` repetitions against that *same* container -- but `memory.peak` is a monotonic
+     watermark since the cgroup was created (confirmed unwritable/unresettable on this host: `echo 0 >
+     memory.peak` inside a running container returned `Read-only file system`), so the samples were a
+     nondecreasing sequence converging on the pair's overall peak, not `N_RUNS` independent
+     measurements. The bug was directly visible in the first run's own raw data (`helix_rack`/
+     `hello_world`'s `rss_bytes_samples`: `[32837632, 33271808, 33271808, ...]`, plateauing after the
+     second run). Fixed by restarting the server container for *every* repetition, not once per pair --
+     more container-boot overhead, judged worth it for genuinely independent samples.
+  2. **The gate could silently print "GATE PASSED" on an intentionally-narrowed run.** `assert_gate!`
+     iterated `SCENARIOS` (the possibly-`BENCH_SCENARIOS`-narrowed set) instead of `ALL_SCENARIOS` --
+     re-introducing, with the wrong constant, exactly the "partial run looks like a full pass" bug this
+     phase's own Resolution note already describes fixing once. Fixed by iterating `ALL_SCENARIOS`
+     unconditionally, so a narrowed run always reports the scenarios it didn't cover as "NOT EVALUATED."
+  3. **No request-correctness threshold in the k6 script, and no k6 exit-status check in the
+     orchestrator.** A run where many requests failed (5xx, connection errors) could still produce a
+     "successful"-looking p99 number from whatever did complete. Fixed with a `checks: ["rate==1.0"]`
+     threshold in `bench/k6/scenario.js` (k6 itself now exits nonzero if any response check fails) and
+     `exception: true` on the `docker run ... k6` call in `bench/run.rb` (a nonzero k6 exit now aborts
+     the whole benchmark run rather than silently continuing to parse a possibly-incomplete summary).
+  4. **README.md's "implemented and gated" implied success.** Corrected to "implemented and evaluated,"
+     with an explicit sentence stating the Phase 13 gate's actual result -- a real finding CodeRabbit
+     caught in prose, not code, but the same honesty discipline this whole phase is built on.
+
+  All four fixed before re-running the full N=10 methodology; the results below are from that
+  corrected run, not the first one.
 - **Real results from a real N=10 run** (`bundle exec rake bench`, this machine, VUS=50, 15s/run,
-  container digest `sha256:8056f62e...`):
+  container digest `sha256:45fa8f6724706810409f4f11c04e2a320702aa72b051a5a58445d5240369c0e7`, the
+  independently-sampled-per-repetition methodology described above -- this superseded an earlier
+  documented run in this same section whose `memory.peak` samples were later found to be
+  non-independent per the CodeRabbit findings above; the numbers below are the corrected run's,
+  verified directly against `bench/results/report.md`/`results.json` on disk and the image actually
+  built, not carried over from the earlier draft):
 
   | scenario | server | P99 median (ms) | P99 range | RSS median (MiB) | RSS range |
   |---|---|---|---|---|---|
-  | hello_world | helix_rack | 42.55 | 42.26-43.03 | 31.7 | 31.3-31.7 |
-  | hello_world | puma | 12.62 | 6.98-15.84 | 132.8 | 121.3-136.6 |
-  | hello_world | falcon | 11.53 | 7.41-17.96 | 53.9 | 48.7-58.6 |
-  | io_mixed | helix_rack | 43.94 | 43.91-44.91 | 68.6 | 68.3-69.0 |
-  | io_mixed | puma | 27.76 | 18.12-42.46 | 76.2 | 68.5-87.9 |
-  | io_mixed | falcon | 28.37 | 24.57-38.45 | 76.9 | 66.3-82.9 |
-  | cpu_bound | helix_rack | 163.95 | 94.53-307.71 | 50.4 | 47.6-50.9 |
-  | cpu_bound | puma | 266.84 | 178.9-435.03 | 191.8 | 174.6-202.1 |
-  | cpu_bound | falcon | 176.16 | 116.78-260.96 | 216.5 | 216.5-219.7 |
+  | hello_world | helix_rack | 42.47 | 42.23-42.86 | 23.4 | 23.1-23.9 |
+  | hello_world | puma | 12.2 | 5.87-23.72 | 110.0 | 101.9-118.1 |
+  | hello_world | falcon | 9.66 | 5.47-15.32 | 39.4 | 38.9-53.2 |
+  | io_mixed | helix_rack | 45.07 | 43.82-53.87 | 60.0 | 51.5-70.5 |
+  | io_mixed | puma | 32.4 | 17.98-84.24 | 67.3 | 64.7-85.7 |
+  | io_mixed | falcon | 29.84 | 16.68-51.87 | 65.4 | 64.7-69.2 |
+  | cpu_bound | helix_rack | 183.56 | 98.53-430.17 | 47.6 | 47.4-69.6 |
+  | cpu_bound | puma | 312.81 | 190.08-401.74 | 156.6 | 142.8-177.7 |
+  | cpu_bound | falcon | 196.31 | 121.08-271.98 | 199.7 | 197.9-213.0 |
 
 - **GATE: FAILED**, honestly, not adjusted or re-run to look better. Against the Gate's actual
-  baseline (Puma):
-  - `hello_world`: P99 ratio 3.373 (need <= 0.6) -- fails badly.
-  - `io_mixed`: P99 ratio 1.583 (need <= 0.6) -- fails; RSS ratio 0.9 (need <= 0.5) -- also fails.
-  - `cpu_bound`: P99 ratio 0.614 (need <= 0.6) -- fails, but narrowly (a 2.3% miss); RSS ratio 0.263
-    -- passes comfortably.
+  baseline (Puma), computed by `bench/run.rb`'s own `assert_gate!` (not hand-recomputed):
+  - `hello_world`: P99 ratio 3.482 (need <= 0.6) -- fails badly.
+  - `io_mixed`: P99 ratio 1.391 (need <= 0.6) -- fails; RSS ratio 0.892 (need <= 0.5) -- also fails.
+  - `cpu_bound`: P99 ratio 0.587 (need <= 0.6) -- **passes**; RSS ratio 0.304 -- passes comfortably.
+    (An earlier draft of this section, before the RSS-sampling bug above was found and fixed,
+    recorded `cpu_bound` as narrowly failing at 0.614 -- that number came from the non-independent
+    sampling run and is superseded by this one, where `cpu_bound` clears the gate on both metrics.)
 - **Root cause, grounded in this project's own already-documented architecture, not a new finding**:
   HelixRack's Tokio runtime is deliberately `current_thread` (PLAN.md's Phase 2 "Architecture note"),
   and the single OS thread that runs it is frozen for the full duration of every `Handler::call`
@@ -1073,17 +1111,19 @@ gate under a fixed methodology**, not a single deterministic assertion:
   scenarios -- consistent with queueing delay dominating the measurement precisely *because* there's
   so little real work to distinguish the servers on otherwise, not despite it. Puma and Falcon, with
   multiple real OS threads/one fiber-scheduled reactor each handling several requests' I/O phases
-  concurrently, don't pay that same queueing cost. `cpu_bound` is the one scenario where the gap nearly
-  closes (0.614, a 2.3% miss) -- plausible read: once *actual* CPU work dominates over queueing, and
-  every server is now contending for the same single vCPU regardless of its own concurrency model,
+  concurrently, don't pay that same queueing cost. `cpu_bound` is the one scenario where HelixRack
+  actually passes the gate (0.587) -- plausible read: once *actual* CPU work dominates over queueing,
+  and every server is now contending for the same single vCPU regardless of its own concurrency model,
   HelixRack's lower per-request overhead (no full Ruby-VM-per-thread stack, Phase 6's preemption
-  keeping any one handler from starving the reactor indefinitely) narrows what multi-threading would
-  otherwise buy Puma -- not proven, a plausible reading of one real result, flagged as a hypothesis
-  rather than a confirmed explanation. RSS tells a different, more consistently favorable story:
-  HelixRack uses meaningfully less memory than both comparisons in 2 of 3 scenarios (`hello_world`:
-  ~4x less than Puma; `cpu_bound`: ~3.8x less), losing only on `io_mixed`, where its own baseline is
-  already so low that a similar absolute increment from holding a `pg` connection reads as a much
-  larger *ratio* than it does for Puma's already-heavier baseline.
+  keeping any one handler from starving the reactor indefinitely) more than offsets what multi-
+  threading would otherwise buy Puma -- not proven, a plausible reading of one real result, flagged as
+  a hypothesis rather than a confirmed explanation. RSS is lower than both comparisons in absolute
+  terms in all three scenarios (`hello_world`: ~4.7x less than Puma; `io_mixed`: ~1.1x less;
+  `cpu_bound`: ~3.3x less), but the Gate's own 0.5 *ratio* threshold is still failed on `io_mixed`
+  (0.892) -- Puma's own baseline there is already low enough (67.3 MiB, vs. 110.0 MiB on
+  `hello_world`) that HelixRack's real, absolute memory advantage doesn't clear a 2x-smaller bar
+  against it, the same "ratio against an already-lean baseline" effect this note flagged in the
+  earlier (superseded) run.
 - **This is not something Phase 13 itself should try to fix by changing the benchmark**, and it was
   not: no parameter (`VUS`, `DURATION`, thread counts) was adjusted after seeing an unfavorable result,
   and none of the harness code was changed to produce a friendlier number. What the P99 gate actually
@@ -1094,9 +1134,11 @@ gate under a fixed methodology**, not a single deterministic assertion:
   a drop-in lever" entry already flags as out of scope for a config change -- a real redesign, not
   something this phase's own deliverable (a benchmark harness and an honest report) should attempt.
   Recorded here as the honest, current state of the implementation: **HelixRack does not currently meet
-  PRD.md 7.2's P99 latency target against Puma under this methodology**, RSS is a genuine, partial win,
-  and the specific queueing mechanism responsible is already understood and documented, not a mystery
-  to chase further within this phase.
+  PRD.md 7.2's P99 latency target against Puma under this methodology overall** (`hello_world` and
+  `io_mixed` both fail the P99 gate; `cpu_bound` passes it), RSS is a genuine, partial win (passes the
+  gate on `hello_world` and `cpu_bound`, fails it narrowly on `io_mixed`), and the specific queueing
+  mechanism responsible is already understood and documented, not a mystery to chase further within
+  this phase.
 
 ## Dependency order
 

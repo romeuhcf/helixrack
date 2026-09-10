@@ -10,11 +10,13 @@ phased implementation plan and the reasoning behind every non-obvious decision a
 
 ## Status
 
-All 14 phases in PLAN.md (Phase 0 through Phase 13) are implemented and gated: the Rust engine,
+All 14 phases in PLAN.md (Phase 0 through Phase 13) are implemented and evaluated: the Rust engine,
 GVL discipline, cooperative preemption, fault containment, graceful shutdown, an I/O-backend
 capability probe, the mimalloc global allocator, full Rack/Grape compliance, precompiled native gem
-packaging, and a comparative benchmark harness against Puma and Falcon. See PLAN.md for each
-phase's own Resolution notes.
+packaging, and a comparative benchmark harness against Puma and Falcon. Implemented is not the same
+as passing every gate: Phase 13's own benchmark currently fails its P99 latency threshold against
+Puma in all three scenarios (a real, understood architecture tradeoff, not a bug -- see PLAN.md's
+Phase 13 Resolution note for the numbers and why). See PLAN.md for each phase's own Resolution notes.
 
 ## Installation
 

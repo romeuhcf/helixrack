@@ -135,13 +135,13 @@ module Bench
     run!("docker", "build", "-f", "bench/Dockerfile", "-t", IMAGE, ".", chdir: REPO_ROOT)
   end
 
-  def boot_server(server)
+  def boot_server(server, scenario)
     teardown_container(SERVER_NAME)
     run!(
       "docker", "run", "-d", "--name", SERVER_NAME, "--network", NETWORK,
       "--cpus", CPUS, "--memory", MEMORY,
       "-p", "19292:9292",
-      "-e", "BENCH_SERVER=#{server}", "-e", "BENCH_APP=#{@current_scenario}",
+      "-e", "BENCH_SERVER=#{server}", "-e", "BENCH_APP=#{scenario}",
       "-e", "BENCH_PG_HOST=#{POSTGRES_NAME}", "-e", "BENCH_PG_PORT=5432",
       "-e", "BENCH_PG_DBNAME=bench", "-e", "BENCH_PG_USER=bench", "-e", "BENCH_PG_PASSWORD=bench",
       IMAGE
@@ -163,6 +163,12 @@ module Bench
   def run_k6(target_path)
     out_path = "/tmp/helixrack-bench-k6-#{Process.pid}.json"
     FileUtils.rm_f(out_path)
+    # CodeRabbit finding: a nonzero k6 exit (e.g. the `checks` threshold in
+    # bench/k6/scenario.js failing because responses weren't actually all
+    # 200) used to go unchecked -- a run full of failed requests could still
+    # produce a "successful"-looking p99 number from whatever did complete.
+    # `exception: true` raises instead, so a bad run aborts the whole
+    # benchmark rather than silently contributing a misleading sample.
     system(
       "docker", "run", "--rm", "--network", NETWORK,
       "-v", "#{REPO_ROOT}/bench/k6:/scripts:ro", "-v", "/tmp:/results",
@@ -172,7 +178,7 @@ module Bench
       "--summary-trend-stats=avg,min,med,max,p(90),p(95),p(99)",
       "--summary-export=/results/#{File.basename(out_path)}",
       "/scripts/scenario.js",
-      out: File::NULL, err: File::NULL
+      out: File::NULL, err: File::NULL, exception: true
     )
     data = JSON.parse(File.read(out_path))
     p99_ms = data.dig("metrics", "http_req_duration", "p(99)")
@@ -190,20 +196,30 @@ module Bench
     sorted.length.odd? ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2.0
   end
 
+  # CodeRabbit finding, confirmed against this project's own first real run's
+  # data: cgroup v2 `memory.peak` is a monotonic watermark since the cgroup
+  # was created (confirmed unwritable/unresettable on this host -- `echo 0 >
+  # memory.peak` inside a running container returned `Read-only file
+  # system`), so measuring it repeatedly against *one* `boot_server` call
+  # shared across all `N_RUNS` doesn't give independent per-run peaks -- it
+  # gives a nondecreasing sequence converging on the pair's overall peak.
+  # The first real run's own `rss_bytes_samples` for helix_rack/hello_world
+  # showed exactly that shape (`[32837632, 33271808, 33271808, ...]`,
+  # plateauing after run 2) before this fix. A fresh container per *run*,
+  # not per (server, scenario) *pair*, is what actually isolates each
+  # sample -- more container-boot overhead (N_RUNS restarts instead of one),
+  # judged worth it for a real, independent measurement.
   def measure(server, scenario)
-    @current_scenario = scenario
-    boot_server(server)
-
     p99s = []
     rss_samples = []
     N_RUNS.times do |i|
+      boot_server(server, scenario)
       p99s << run_k6(SCENARIOS.fetch(scenario))
       rss_samples << sample_memory_peak_bytes
+      teardown_container(SERVER_NAME)
       rss_mib = (rss_samples.last / 1_048_576.0).round(1)
       warn "  [#{server}/#{scenario}] run #{i + 1}/#{N_RUNS}: p99=#{p99s.last.round(2)}ms rss=#{rss_mib}MiB"
     end
-
-    teardown_container(SERVER_NAME)
 
     {
       "server" => server,
@@ -271,7 +287,16 @@ module Bench
   # "not evaluated", distinct from "evaluated and passed" -- a partial/
   # debugging run can never silently print a real-looking "GATE PASSED".
   def assert_gate!(results)
-    per_scenario = SCENARIOS.each_key.to_h { |s| [s, gate_failures_for(s, results)] }
+    # `ALL_SCENARIOS`, not `SCENARIOS` -- CodeRabbit finding: a run scoped
+    # via `BENCH_SCENARIOS` (see that constant) would otherwise only iterate
+    # the narrowed set, so a scenario deliberately excluded from this run
+    # would never even register as "skipped," letting an *intentionally*
+    # partial debugging run silently print a real-looking "GATE PASSED" once
+    # every scenario it *did* check happened to pass. The full, unnarrowed
+    # scenario list is what actually has to be accounted for -- either
+    # evaluated or explicitly reported missing -- for that message to mean
+    # anything.
+    per_scenario = ALL_SCENARIOS.each_key.to_h { |s| [s, gate_failures_for(s, results)] }
     skipped, evaluated = per_scenario.partition { |_, v| v.nil? }.map(&:to_h)
     failures = evaluated.values.flatten
 
