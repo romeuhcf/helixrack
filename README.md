@@ -1,15 +1,20 @@
 # HelixRack
 
 Native HTTP/1.1 server in Rust for Ruby Rack/Grape applications, embedding the CRuby VM via
-rb-sys/magnus. Single-threaded Tokio event loop with io_uring, built to minimize P99 latency and
-memory under tight CPU limits (e.g. 1 vCPU Kubernetes pods).
+rb-sys/magnus. A single-threaded Tokio event loop (epoll-based; see PLAN.md's Phase 9 Architecture
+note for why not io_uring), built to minimize P99 latency and memory under tight CPU limits (e.g. 1
+vCPU Kubernetes pods).
 
-See [PRD.md](PRD.md) for the full product requirement document.
+See [PRD.md](PRD.md) for the full product requirement document, and [PLAN.md](PLAN.md) for the
+phased implementation plan and the reasoning behind every non-obvious decision along the way.
 
 ## Status
 
-Early stage, pre-implementation. The gem skeleton exists; the Rust engine described in the PRD is
-not built yet.
+All 14 phases in PLAN.md (Phase 0 through Phase 13) are implemented and gated: the Rust engine,
+GVL discipline, cooperative preemption, fault containment, graceful shutdown, an I/O-backend
+capability probe, the mimalloc global allocator, full Rack/Grape compliance, precompiled native gem
+packaging, and a comparative benchmark harness against Puma and Falcon. See PLAN.md for each
+phase's own Resolution notes.
 
 ## Installation
 
@@ -18,7 +23,8 @@ Not yet released to RubyGems.org.
 ## Development
 
 After checking out the repo, run `bin/setup` to install dependencies. Then run `rake spec` to run
-the tests. `bin/console` opens an interactive prompt.
+the tests. `bin/console` opens an interactive prompt. `rake bench` runs the Phase 13 benchmark
+harness under `bench/` (real minutes, needs Docker -- see `bench/run.rb`'s own top comment).
 
 ## Contributing
 

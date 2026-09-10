@@ -101,4 +101,17 @@ task "gem:native" do
   RakeCompilerDock.sh(command, platform: "x86_64-linux-gnu")
 end
 
+# Phase 13 (PLAN.md, Phase 13): builds a fresh benchmark image, runs the
+# full N-run methodology across every (server, scenario) pair, and asserts
+# PLAN.md's own Gate. Real minutes (a genuine cross-compile-free but still
+# from-scratch Docker build, then N=10 x 3 scenarios x 3 servers real load
+# runs), so a plain script invocation rather than a `default`-task
+# dependency -- see `bench/run.rb`'s own top comment for the full reasoning,
+# matching Phase 10/12's established precedent for scoping a heavy, real
+# verification outside the fast loop.
+desc "Run the Phase 13 benchmark harness (bench/run.rb) -- real minutes, not part of the default task"
+task "bench" do
+  ruby "bench/run.rb"
+end
+
 task default: %i[compile spec rubocop]

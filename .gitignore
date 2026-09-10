@@ -16,6 +16,12 @@ target/
 # rspec failure tracking
 .rspec_status
 
+# Phase 13 (PLAN.md, Phase 13): generated per-run, not committed -- real
+# results get quoted directly in PLAN.md's own Phase 13 Resolution note,
+# matching how other phases document measured findings as prose/evidence
+# rather than committing the raw artifact.
+/bench/results/
+
 # gem libraries don't commit a lockfile; apps consuming this gem pin their own
 /Gemfile.lock
 /Cargo.lock
