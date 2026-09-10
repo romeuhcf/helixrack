@@ -801,6 +801,47 @@ serialization) served through HelixRack.
 **Gate:** the official Rack::Lint suite green; a request-spec table (route x params x expected
 status/JSON body) asserted exactly, one row per scenario from PRD section 7.1.
 
+**Resolution:**
+
+- **One gate does both halves of PRD.md 7.1's ask, on purpose.** `spec/fixtures/apps/phase11_grape.ru`
+  wraps the fixture Grape app in the real `Rack::Lint` middleware (`use Rack::Lint`) for the whole life
+  of the one server subprocess `spec/integration/phase11_rack_grape_spec.rb` boots. Every request the
+  gate's scenario table drives through that process is therefore *also* a live conformance check of
+  HelixRack's own env construction and response handling: a `Rack::Lint::LintError` takes the identical
+  path through `RackAppHandler::handle` (`ext/helix_rack/src/lib.rs`) that Phase 7's fixture app's plain
+  `StandardError` row exercises, surfacing as a `500` and a `"request failed"` line in the server's
+  stderr fault log -- indistinguishable from any other app-level exception by HTTP status alone. Every
+  example therefore asserts the fault log gained *nothing*, not just the expected status/body, so a
+  regression that happened to still produce the "right-looking" status code for the wrong reason (a Lint
+  violation rather than Grape's own logic) would still fail the gate.
+- **Verified this isn't tautological**, the same discipline this project has applied to every prior
+  phase's gate (Phase 9's io-backend distinction, Phase 10's allocator-routing check): temporarily
+  injected a genuine Rack::Lint violation into the fixture app (a non-numeric `Content-Length` header on
+  the `/widgets/:id` route) and confirmed, against the real running subprocess, that the affected example
+  failed for exactly the expected reason (`500` instead of `200`) -- then reverted it. Confirmed
+  separately, with a minimal standalone script, that `Rack::Lint` itself does raise `Rack::Lint::LintError`
+  on a real spec violation (a string status code) before relying on it inside the gate.
+- **Every status code in the fixture app is explicit** (`status 201`, `status 200`), not left to Grape's
+  own per-verb default -- this gate's whole point is asserting *exact* statuses, so it shouldn't depend on
+  an unstated, version-specific Grape default. The 404 row is the one exception: Grape's own not-found
+  response shape (plain-text `"404 Not Found"`, no `content-type`, confirmed by direct observation against
+  the real running app before writing the assertion) isn't pinned to an exact body, only the status and
+  the fault-log-is-empty assertion -- that shape isn't this project's own contract to guarantee.
+- **`/boom` and the missing-`name` row produce non-2xx statuses but are not HelixRack-side faults**: both
+  are caught entirely inside Grape's own `rescue_from` error middleware
+  (`spec/fixtures/apps/phase11_grape_app.rb`), which returns a clean `[status, headers, body]` triple from
+  *inside* Grape's dispatch -- no exception ever reaches `RackAppHandler::handle`, so the fault log stays
+  empty for those rows too, same as every other row.
+- **`grape` (`~> 4.0`) added to the `Gemfile` only**, not the gemspec -- it drives this gate's fixture app,
+  it is not a runtime dependency of the gem itself (any Rack-compliant app works unmodified, Grape
+  included, exactly the property this phase is verifying), matching how `rspec`/`rubocop` are already
+  `Gemfile`-only in this project.
+- **New `spec/support/phase11_server_helper.rb`**, not a reuse/edit of Phase 7's, matching this project's
+  established per-phase-own-helper convention -- same boot/wait/reap subprocess technique as Phase 7's,
+  minus the `HELIX_RACK_DEBUG_PANIC` env var and PID-liveness plumbing neither of which this gate needs.
+- **No `ext/helix_rack/` or `engine/` changes this phase** -- pure Ruby/fixture/spec work, so the mandatory
+  `ext/`-touching safety-review pass (this repo's own `CLAUDE.md` rule) does not apply here.
+
 ## Phase 12 — Packaging
 
 **Deliverable:** static binary, native gem built via `rake-compiler-dock`/`rb_sys` for target
