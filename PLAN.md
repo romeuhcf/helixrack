@@ -234,7 +234,37 @@ turns out false, the fix that makes it true.
 
 `--cpu-time-slice`; `rb_postponed_job` fires when a handler runs CPU-bound past the threshold.
 
-**Deliverable:** long-running CPU-bound handlers don't fully starve the event loop.
+**Architecture note (a watchdog thread — the first deviation from strict single-OS-thread, and
+why):** the Rust side cannot notice a long-running `Handler::call` on its own — it has handed
+control to Ruby's VM synchronously and gets none back until the Ruby call returns. `rb_postponed_
+job_trigger` is documented as callable from any thread (or a signal handler) without holding the
+GVL, specifically for this "someone else notices and interrupts" pattern (this needs verifying
+against real Ruby source/docs before relying on it, not assumed from memory). That means the only
+way to detect "this request has run past `cpu_time_slice`" is a second, dedicated OS thread — a
+watchdog — whose only job is: track the current request's deadline (set by the main thread right
+before each `Handler::call`, cleared right after), and if that deadline passes while still set,
+call `rb_postponed_job_trigger`. This is a real exception to PRD.md RNF01 ("sem criação de thread
+pools adicionais"): one watchdog thread is not a *pool* (it never processes a request, never
+touches a connection, never calls into Ruby directly), but it is an additional OS thread, and that
+distinction is being drawn deliberately here, not glossed over.
+
+**Open question, investigate empirically before committing to full scope (matching Phase 5's
+successful pattern — don't assume, measure):** PRD.md's RF07 wording asks for the postponed job's
+callback to let "the Event Loop process pending I/O events on the socket" — actually driving
+Tokio's reactor forward from inside a callback invoked synchronously by Ruby's own bytecode
+dispatch, nested inside the original (still-technically-in-progress) `Handler::call`'s `with_gvl`
+scope. Whether that's safely achievable (re-entrancy into the Tokio runtime from that nested
+position, without risking a second nested call into Ruby, or corrupting the outer call's state) is
+genuinely unverified. This phase's *gate* only requires proving the trigger mechanism itself fires
+correctly (a counter, per PLAN.md's original wording below) — attempt the fuller "actually drains
+Tokio" capability only if investigation shows it's safe and tractable; if not, ship the verified
+counter-based mechanism and document the gap plainly (no other phase in this plan revisits it, so
+say so rather than imply it's covered elsewhere).
+
+**Deliverable:** long-running CPU-bound handlers don't fully starve the event loop, or, if that
+fuller capability isn't safely achievable within this phase, a verified, correctly-firing
+preemption *signal* (the mechanism RF07 asks for) with the "does it actually unstarve the loop"
+gap documented, not silently claimed.
 
 **Gate:** instrument the postponed-job hook to increment a counter exposed back to the test (e.g.
 a Ruby `$postponed_job_count` global, or an FFI counter). Run a fixture handler that busy-loops
