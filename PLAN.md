@@ -672,6 +672,127 @@ lets it mean: adding capability detection didn't change existing behavior).
 compiled artifact confirms the allocator's symbols are present and the default `malloc` is not
 what's linked. Deterministic yes/no, no runtime measurement needed.
 
+**Resolution:**
+
+- **Chose mimalloc over jemalloc**, for a reason grounded in Phase 9's own experience, not a coin
+  flip: Phase 9's safety review found an unconditional Linux-only dependency (`io-uring`) would have
+  broken this gem's cross-platform builds, caught only by an actual cross-compile check, not by
+  reading the crate's description. Verified (web search, not assumed) that the `mimalloc` crate
+  genuinely supports Linux/macOS/Windows, unlike the more Linux-centric `jemalloc`/`tikv-jemallocator`
+  ecosystem. A local `cargo check --target x86_64-apple-darwin` for `mimalloc` itself failed here --
+  but for a different, non-architectural reason than Phase 9's: a missing macOS C cross-toolchain in
+  this sandbox (`cc: error: unrecognized command-line option '-arch'`), not a missing API the way
+  `io-uring`'s failure was. Real cross-compilation for non-Linux gem platforms happens through
+  `rake-compiler-dock`'s own cross-toolchain images (Phase 12), which this sandbox doesn't have --
+  **not independently verified end-to-end**, flagged honestly rather than assumed clean.
+- **Scope, stated plainly:** `#[global_allocator]` (`ext/helix_rack/src/lib.rs`) replaces the
+  allocator for this extension's *own* Rust-side heap traffic (the `Vec`/`String`/`Box` churn
+  `engine::connection`'s HTTP parsing, buffering, and response construction does -- exactly where
+  this project's own allocation activity happens, and RNF03's stated fragmentation concern). It does
+  **not** replace Ruby's own object allocator (CRuby's VALUE heap is its own GC-managed arena system,
+  not a thin `malloc` wrapper this attribute intercepts) and does not attempt a process-wide `malloc`
+  symbol override (which a `dlopen`'d extension *can* attempt via symbol interposition, but doing that
+  soundly for a shared library loaded into an already-running process -- not a standalone binary, the
+  usual case this technique targets -- was judged a meaningfully larger, riskier change than this
+  phase's actual, achievable deliverable).
+- **Verified the gate proves something real, not a tautology** -- a real risk for a "symbols are
+  present" check, since mimalloc's C code could plausibly get linked in as an unused transitive
+  dependency while actual allocations still went through the platform default. Checked by hand first,
+  against the real compiled `.so`, before writing any gate code: `nm` confirms `mi_malloc_aligned`
+  and friends are defined (not just referenced); `objdump -d` on `__rust_alloc` (the Rust ABI hook
+  every `Vec`/`Box`/`String` allocation compiles down to) shows a single indirect `jmp *offset(%rip)`;
+  `objdump -R` resolves that GOT offset's relocation to an address that is, byte for byte, one of
+  `mi_malloc_aligned`'s own -- proof of actual wiring, not just co-presence. The gate spec encodes
+  exactly this, and was itself verified to actually catch a regression: temporarily removed
+  `#[global_allocator]`, rebuilt, confirmed both examples failed for the expected reason, then
+  restored it and confirmed both pass again.
+- **Safety review (mandatory `ext/`-touching pass) findings, second round:**
+  1. **[Medium, fixed]** `-ftls-model=initial-exec`: mimalloc's vendored C code compiles with this TLS
+     model by default via `libmimalloc-sys`'s own `build.rs`, consuming a small, artifact-wide static-TLS
+     slot shared with every other `dlopen`'d library in the host Ruby process -- capable of making a
+     *later, unrelated* `require`/`dlopen` in the same process fail outright with "cannot allocate memory
+     in static TLS block," not just degrade. Fixed by enabling `mimalloc`'s own `local_dynamic_tls`
+     feature (`ext/helix_rack/Cargo.toml`), which forwards straight through to `libmimalloc-sys`'s
+     feature of the same name -- an initial version of this fix added `libmimalloc-sys` as an
+     unnecessary explicit direct dependency, on the mistaken assumption that `mimalloc`'s own
+     `[features]` table only re-exposed `debug`/`debug_in_debug`; a CodeRabbit review comment on this
+     PR caught it, and checking the actual vendored 0.1.52 `Cargo.toml` confirmed `local_dynamic_tls =
+     ["libmimalloc-sys/local_dynamic_tls"]` is there, so the extra direct dependency was removed.
+     Independently re-verified against the rebuilt `.so` with `readelf -Wr`: `TPOFF64` relocation count
+     went from the reviewer's own measured nonzero baseline to 0; 8 `DTPMOD64`/`DTPOFF64` relocations
+     remain (the safe general-dynamic-model kind); `nm | grep -c mi_malloc` confirmed mimalloc is still
+     linked (unchanged at 2).
+  2. **[Low, addressed]** Recommended actually exercising `.github/workflows/build-gems.yml` via
+     `workflow_dispatch` now, to de-risk cross-platform/cross-compiled mimalloc builds before a real
+     release rather than discovering a break then -- directly motivated by Phase 9's own precedent (a
+     Linux-only dependency that broke non-Linux builds, caught only by an actual cross-compile attempt).
+     Judged safe to trigger without separate confirmation: the workflow only builds gems and uploads them
+     as private, auto-expiring GitHub Actions artifacts (`actions/upload-artifact`), it publishes nothing
+     external, and it's the same kind of repo-internal CI this project already runs on every PR.
+     Worth doing: the first-ever run of this workflow (it had only ever fired on a tag push or manual
+     dispatch before, neither of which had happened yet) immediately found a real, pre-existing gap
+     unrelated to mimalloc -- `source-gem` and every `cross-gem` matrix job's `ruby/setup-ruby@v1` step
+     omitted `ruby-version`, which needs a committed `.ruby-version`/`.tool-versions` file to resolve a
+     "default" version; this repo has neither (`main.yml`'s own equivalent step always passed an explicit
+     `ruby-version: ${{ matrix.ruby }}`, so this codepath was never exercised there). Fixed by pinning
+     `ruby-version: '4.0.6'` explicitly in both steps, matching `main.yml`'s own pinned version.
+     The re-run past that fix hit its default `fail-fast: true` matrix behavior: one platform
+     (`arm-linux-musl`) failed for a reason with nothing to do with this project -- `docker pull
+     rbsys/arm-linux-musl:0.9.128` itself 404s (`manifest unknown`), an upstream `oxidize-rb`/`rb_sys`
+     tooling image gap -- and that single failure cancelled every other platform's job before they even
+     started, hiding whether mimalloc itself cross-compiles cleanly anywhere. Added `fail-fast: false` to
+     let each platform run independently (a safe, generally-good change regardless of this phase). The
+     resulting full run was worth the cost: 8 of 10 platforms succeeded outright, including every platform
+     that actually matters for this project's own deployment target -- `x86_64-linux`, `aarch64-linux`,
+     `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-darwin`, `arm64-darwin`, `aarch64-mingw-ucrt` --
+     and it surfaced a second, genuine (not infra-flake) finding: `x64-mingw-ucrt` (64-bit Windows via the
+     GNU mingw cross-toolchain) fails to compile mimalloc's vendored C source at all --
+     `error: 'ERROR_COMMITMENT_MINIMUM' undeclared` in `libmimalloc-sys`'s `prim/windows/prim.c`. Verified
+     this is a real, currently-unresolved upstream issue, not something specific to this project or a
+     stale local toolchain: the identical error, same undeclared symbol, same file, reproduces in an
+     unrelated project (`egui`) cross-compiling to `x86_64-pc-windows-gnu` with an earlier `libmimalloc-sys`
+     version (0.1.42) too (github.com/emilk/egui/issues/7033, open, no workaround posted) -- the mingw-w64
+     headers this cross-toolchain ships are missing a Windows SDK constant mimalloc's Windows code expects.
+     `aarch64-mingw-ucrt` succeeding regardless points to a different cross-compiler/header set for that
+     target, not a fix for this one. Not chased further here: this project's real deployment target is a
+     Linux/macOS server, `x64-mingw-ucrt` is one line in a cross-gem release-platform list, and Phase 12
+     ("Packaging") is the phase actually responsible for the native-gem release pipeline this finding
+     belongs to -- flagged there rather than solved piecemeal inside Phase 10's own allocator-integration
+     scope.
+  3. **[Low, documented]** `Cargo.lock` is gitignored (`.gitignore:21`, a pre-existing, unmodified
+     project choice -- matching how `rb_sys`-based extension gems typically avoid pinning dependents'
+     resolution), so a fresh `cargo build` re-resolves `mimalloc` (and its `libmimalloc-sys` dependency)
+     each time rather than reusing a locked graph. The direct dependency declaration already narrows this
+     in practice -- `mimalloc = "0.1.52"` (`ext/helix_rack/Cargo.toml`) is a Cargo caret requirement, which
+     on a pre-1.0 crate only admits patch-level bumps (`0.1.z`, `z` >= 52), not a silent jump to a
+     different vendored mimalloc *major* -- confirmed against the
+     actual resolved graph via `cargo tree -p mimalloc -p libmimalloc-sys`, which shows exactly
+     `libmimalloc-sys v0.1.49` / `mimalloc v0.1.52` today, matching the `Cargo.toml` minimums exactly.
+     Not pinning `Cargo.lock` itself, or switching to exact (`=`) version requirements, was judged a
+     project-wide dependency-policy change out of proportion to this one phase's deliverable -- recorded
+     here as a known, accepted drift surface rather than silently left undocumented.
+  4. **[Low, fixed]** The gate (`spec/integration/phase10_allocator_spec.rb`) is x86-64 Linux/GNU-
+     binutils specific (a literal `jmp *offset(%rip)` disassembly pattern, `objdump -R`'s `*ABS*+0x...`
+     relocation format, a `.so` filename), and originally *raised* rather than skipped everywhere else --
+     CI (`main.yml`) is `ubuntu-latest` x86-64 only so this never fired there, but it would fail loudly
+     and unhelpfully for a contributor on e.g. Apple Silicon running `bundle exec rake` locally. Fixed
+     with a `before` guard that `skip`s (not raises) when `RUBY_PLATFORM` isn't Linux/x86-64, or when
+     `nm`/`objdump` aren't on `PATH` -- matching the shape Phase 9's own gate note already established for
+     a platform-specific check.
+  5. **[Informational, documented]** Two accepted gaps, neither a regression this diff introduces --
+     both are inherent to adding *any* `#[global_allocator]` to a Ruby C extension: no `pthread_atfork`
+     handler is registered, so a process that `fork()`s while another thread holds an internal mimalloc
+     lock (CRuby's own `Process.fork`, or a pre-fork server) could leave the child with a wedged
+     allocator -- out of scope since this project's own test/serve paths never fork, and a real fix needs
+     auditing every deployment topology this extension could load into; and mimalloc's own double-
+     free/corruption detection is compiled out at `MI_DEBUG=0` (this build's default), trading that
+     diagnostic for release-mode speed -- the `debug`/`debug_in_debug` Cargo features exist for turning it
+     back on when investigating a suspected corruption bug. Both documented directly in
+     `GLOBAL_ALLOCATOR`'s doc comment (`ext/helix_rack/src/lib.rs`), not just here.
+  6. **[Nit, fixed]** `GLOBAL_ALLOCATOR`'s doc comment said "process-wide" where "artifact-wide" is what's
+     actually true -- a second, unrelated Rust extension `dlopen`'d into the same Ruby process keeps its
+     own allocator; `#[global_allocator]` binds once per linked artifact, not once per OS process.
+
 ## Phase 11 — Full Rack compliance + Grape integration
 
 **Deliverable:** a fixture Grape app (nested routes, param validation, error middleware, JSON
@@ -689,6 +810,15 @@ platforms.
 0, then `helix_rack --version` and `helix_rack --help` produce expected exact output. No build
 tools present in that container — proves it's truly precompiled, not silently falling back to
 source compilation.
+
+**Known input from Phase 10:** a `workflow_dispatch` run of `build-gems.yml` (Phase 10's Resolution
+note, second safety-review round, finding 2) found `x64-mingw-ucrt` fails to cross-compile at all --
+mimalloc's vendored C source hits a genuine, currently-open upstream mingw-w64/Windows-SDK-header
+incompatibility (`ERROR_COMMITMENT_MINIMUM` undeclared), unrelated to this project's own code. Every
+other real deployment platform (both Linux libc flavors and both glibc/musl variants, both macOS
+architectures) built cleanly. This phase needs to decide: exclude `x64-mingw-ucrt` from the shipped
+platform list (matching the existing `exclude: ["arm-linux", "x64-mingw32"]` precedent in
+`build-gems.yml`'s `ci-data` job), or revisit once upstream fixes it -- not decided yet.
 
 ## Phase 13 — Benchmarking (PRD section 7.2) — explicitly NOT deterministic, treat differently
 
