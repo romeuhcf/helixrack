@@ -5,16 +5,22 @@ require "optparse"
 require "rack"
 require "helix_rack"
 
-# PRD.md section 6.2's Phase-2/Phase-4-relevant flags (-a/-p/-b, --keep-alive-timeout,
-# --max-keepalive): --cpu-time-slice belongs to Phase 6 and is not implemented yet.
+# PRD.md section 6.2's CLI flags (-a/-p/-b from Phase 2, --keep-alive-timeout/
+# --max-keepalive from Phase 4, --cpu-time-slice from Phase 6).
 options = {
   app: "config.ru",
   port: 8080,
   bind: "0.0.0.0",
   keep_alive_timeout: 15,
-  max_keepalive: 10_000
+  max_keepalive: 10_000,
+  cpu_time_slice_ms: 5
 }
 
+# rubocop:disable Metrics/BlockLength -- one `parser.on` clause per PRD.md
+# section 6.2 CLI flag; this grows by design as later phases add flags
+# (matching how Phase 4's --keep-alive-timeout/--max-keepalive and now
+# Phase 6's --cpu-time-slice were each added here), not something to split
+# up for a line-count target.
 OptionParser.new do |parser|
   parser.banner = "Usage: helix_rack [options]"
   parser.on("-a", "--app PATH", "Path to the Rackup / Grape app (default: config.ru)") do |v|
@@ -38,12 +44,20 @@ OptionParser.new do |parser|
   ) do |v|
     options[:max_keepalive] = v
   end
+  parser.on(
+    "--cpu-time-slice MS", Integer,
+    "Continuous CPU time (ms) a handler may run before a preemption signal fires (default: 5)"
+  ) do |v|
+    options[:cpu_time_slice_ms] = v
+  end
 end.parse!(ARGV)
+# rubocop:enable Metrics/BlockLength
 
 app = Rack::Builder.parse_file(options[:app])
 HelixRack.serve(
   app, options[:port],
   bind: options[:bind],
   keep_alive_timeout: options[:keep_alive_timeout],
-  max_keepalive: options[:max_keepalive]
+  max_keepalive: options[:max_keepalive],
+  cpu_time_slice_ms: options[:cpu_time_slice_ms]
 )

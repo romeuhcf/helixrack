@@ -24,7 +24,36 @@ module HelixRack
   # lifecycle (see `PLAN.md`, Phase 4): PRD.md section 6.2's defaults (15
   # seconds, 10000 requests) apply unless the caller (`exe/helix_rack`'s
   # `--keep-alive-timeout`/`--max-keepalive` flags) overrides them.
-  def self.serve(app, port, bind: "0.0.0.0", keep_alive_timeout: 15, max_keepalive: 10_000)
-    _serve_native(app, port, bind, keep_alive_timeout, max_keepalive)
+  #
+  # `cpu_time_slice_ms` implements Phase 6's preemption signal (see
+  # `PLAN.md`, Phase 6): PRD.md section 6.2's default (5ms) applies unless
+  # the caller (`exe/helix_rack`'s `--cpu-time-slice` flag) overrides it. See
+  # `ext/helix_rack/src/lib.rs`'s `watchdog` module doc comment for what this
+  # does and, importantly, does not do -- it is a correctly-firing signal
+  # that a handler ran past the slice, counted and readable via
+  # `HelixRack.postponed_job_count`, not a guarantee that other connections
+  # actually get serviced during that pause.
+  # rubocop:disable Metrics/ParameterLists -- one keyword argument per
+  # PRD.md section 6.2 CLI flag (mirroring `exe/helix_rack`'s `parser.on`
+  # clauses one for one), plus the two positional Rack-required arguments
+  # (`app`, `port`); this is expected to keep growing by one as later
+  # phases add flags, the same way Phase 6 just added `cpu_time_slice_ms`
+  # to Phase 4's existing `keep_alive_timeout`/`max_keepalive`.
+  def self.serve(
+    app, port,
+    bind: "0.0.0.0", keep_alive_timeout: 15, max_keepalive: 10_000, cpu_time_slice_ms: 5
+  )
+    _serve_native(app, port, bind, keep_alive_timeout, max_keepalive, cpu_time_slice_ms)
+  end
+  # rubocop:enable Metrics/ParameterLists
+
+  # Phase 6 (`PLAN.md`, Phase 6): how many times the postponed-job
+  # preemption signal has actually fired, process-wide, since the extension
+  # loaded -- see `ext/helix_rack/src/lib.rs`'s `watchdog` module doc
+  # comment. Does not reset between `serve` calls in the same process; a
+  # caller that wants to know whether *this* request tripped it should
+  # capture a baseline before the request and compare the delta afterward.
+  def self.postponed_job_count
+    _postponed_job_count
   end
 end
