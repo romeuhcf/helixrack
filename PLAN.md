@@ -349,6 +349,121 @@ logic (inside the FFI boundary, not at it), so a panic there can become a `500` 
 fixture, assert (a) the response is exactly `500`, (b) the process PID is unchanged afterward, (c)
 the very next unrelated request still succeeds with `200`. All three are exact assertions.
 
+**Resolution:**
+
+- The inner `catch_unwind` this phase's job description calls for lives in `Handler::call`
+  (`ext/helix_rack/src/lib.rs`), wrapped around the whole call to `self.handle(req)`: `Ok(Ok(_))` is
+  the normal response, `Ok(Err(_))` (a Ruby-side failure `handle` already turned into `Err`) and
+  `Err(_)` (a genuine Rust panic caught here) both map to the same `error_response()` (`500`, a real
+  `text/plain` body with a correct `Content-Length` — the "real error body" half of this phase's
+  narrowed scope) after being logged once via `log_fault`. Sound to catch here rather than only at
+  `gvl::trampoline`'s outer boundary — but this soundness argument took **two** rounds of
+  safety-review correction to get right, both worth recording since the mistake pattern is the same
+  both times (a blanket claim standing in for a checked one): the first version claimed "no Rust code
+  in `self.handle` ever sits under a live Ruby/C frame", which is false for `read_body`'s
+  `body.block_call("each", ...)` (magnus's own re-entrant callback shape, live above the per-chunk
+  Rust closure while it runs). The fix identified that magnus wraps `block_call`'s closure in its
+  *own* `catch_unwind` already, converting a panic caught there into a raised Ruby exception before
+  it reaches this crate's frames — so it surfaces as `Ok(Err(_))`, not `Err(_)` — and restated the
+  claim as "exactly one kind of re-entrant call, and magnus already wraps it". A second
+  re-verification pass on *that* restated claim found it was **also** too narrow: Phase 6's
+  `watchdog::postponed_job_callback` is a second, genuinely re-entrant Ruby-to-Rust callback live
+  inside `self.handle`'s dynamic extent (Ruby dispatches it at an interrupt checkpoint that can land
+  inside `app.funcall("call", env)` while the watchdog is armed) — and it is *not* one of magnus's
+  wrapped shapes, it's a raw `unsafe extern "C" fn` registered by hand. Sound anyway, but for a
+  different reason than `block_call`'s: that callback's entire body is one atomic `fetch_add`, no
+  allocation, no Ruby call, no `unwrap`/`expect` — panic-free by construction, not panic-caught by
+  magnus. The final, currently-accurate version names both callbacks and both of their distinct
+  soundness arguments explicitly, in `Handler::call`'s own doc comment and in
+  `postponed_job_callback`'s (which now states its own panic-freedom as a maintained invariant, not
+  an implementation detail) — read those rather than this note for the full text, since a third
+  callback could make this note stale again without a third correction landing here.
+- `log_fault` logs to the process's real stderr, deliberately never back through Ruby's own
+  `$stderr`/`rack.errors`: safe to do for the `Err(magnus::Error)` case (any Ruby call that led to it
+  had already returned before `handle` produced the error), but far less certain for the caught-panic
+  case (the panic could in principle fire mid-way through establishing some magnus/Ruby-side
+  invariant), and this one call site has no way to tell which case it's in once it only holds a
+  formatted `String` — so it never calls back into Ruby from either branch. Writes via a discarded
+  `io::Result` (`let _ = writeln!(io::stderr(), ...)`), not `eprintln!` — a safety-review finding,
+  confirmed by reproduction, that `eprintln!` itself panics if the underlying write fails (e.g. a
+  full disk), and this call runs *after* `Handler::call`'s own `catch_unwind` has already returned,
+  so such a panic would have escaped to `gvl::trampoline`'s outer boundary and aborted the whole
+  process — the fault-logging path becoming a bigger crash risk than the fault it logs. Dropping a
+  log line on a full disk is the correct tradeoff; crashing the server over it is not.
+- **A real bug found and fixed while building this phase's gate, worth recording because it was
+  silent (degraded gracefully, not a crash) rather than loud:** the first version of the caught-panic
+  branch passed `&payload` (`payload: Box<dyn Any + Send>`) to a helper expecting `&(dyn Any + Send)`,
+  relying on implicit deref coercion. That compiles, but produces the *wrong* answer: `Box<dyn Any +
+  Send>` is itself `'static`, so it satisfies `Any`'s own blanket impl, and Rust silently prefers
+  unsize-coercing the outer `Box` itself into the trait object over deref-coercing to the boxed
+  *contents* — every `downcast_ref::<&str>()`/`::<String>()` then misses, even for a plain string-
+  literal panic, with no compiler warning. Confirmed with a standalone reproduction outside this
+  crate (`&payload` → "no match" vs. `&*payload` → "matched &str", same payload, same Rust 1.95)
+  before touching the real code — this was not an assumption about Rust's coercion rules, it was
+  checked. Fixed by having the helper take the `Box` by value and call `downcast_ref` on it directly
+  (method-call auto-deref resolves unambiguously there); the fallback-to-placeholder path this bug
+  was silently hitting is real product behavior (a caught panic's actual message was never getting
+  logged, just `"<non-string panic payload>"`), so this was a genuine, if low-severity (no crash, no
+  wrong HTTP response, only a degraded log line), correctness bug in this phase's own new code, not
+  hypothetical.
+- The gate's third fixture row ("an ext function that panics deliberately") went through one design
+  change worth recording too, because the first version didn't actually test what it looked like it
+  tested: it exposed a separate Ruby-callable `HelixRack._debug_panic` module function for the
+  fixture Rack app to call. Verified by direct smoke test against the compiled binary (not assumed)
+  that this **does not exercise `Handler::call`'s `catch_unwind` at all** — magnus already wraps
+  every `define_module_function`/`method!`-registered function in its own `catch_unwind`
+  (`magnus-0.8.2/src/method.rs`'s `call_handle_error`, `Error::from_panic`), which converts a panic
+  caught *there* straight into a raised Ruby exception before it ever reaches this crate's own code.
+  So that fixture's panic was landing in `Handler::call`'s `Ok(Err(err))` branch, not its `Err(_)`
+  one — a real (pre-existing, not introduced by this phase) safety net, but the wrong one for this
+  gate row to be exercising, since it left the actual Phase 7 deliverable (the *inner* `catch_unwind`
+  this phase adds) completely untested by that fixture. Fixed by moving the trigger inside
+  `RackAppHandler::handle`'s own body instead: a request carrying `X-HelixRack-Debug-Panic: 1` panics
+  directly there, with no intervening Ruby-callable-function hop, which does reach the code path this
+  phase is actually testing (confirmed via the same smoke-testing technique, both before and after the
+  fix, with the server's own stderr output as the evidence — see this section's git history for the
+  exact before/after log lines if useful).
+- `SystemStackError` needed no special handling beyond what `handle` already does: Ruby's own
+  stack-overflow guard raises it as a regular exception once the VM's C stack limit is hit (not a
+  process signal, not something that bypasses `funcall`'s normal error return), so it takes the same
+  `Err(magnus::Error)` path as any other raised exception — confirmed via the gate spec itself
+  passing, not assumed from how Ruby is generally understood to behave.
+- **Two further safety-review findings, both fixed, both on the gate's third fixture row (the
+  deliberate debug-header panic inside `handle`):** first, that header check was originally
+  unconditional — reachable by any client, in the actual release build this gem ships (verified:
+  `exe/helix_rack` loads the release `.so`, not a debug one) — which is a real problem on its own (a
+  free remote panic-amplification knob, worse with `RUST_BACKTRACE=1` set, all of it costed on this
+  server's one event-loop thread) and a much worse one if this crate's build profile ever gains
+  `panic = "abort"` (nothing pins `panic = "unwind"` today), at which point the same header stops
+  being "a caught panic" and becomes a one-request remote process kill. Fixed by gating it behind
+  `debug_panic_header_enabled()`, reading `HELIX_RACK_DEBUG_PANIC=1` once via a `OnceLock`, off by
+  default — `spec/support/phase7_server_helper.rb` is the one legitimate caller that sets it. Second,
+  the gate itself (before this fix) could not actually tell the panic row's `500` apart from the two
+  Ruby-exception rows' `500`s — identical response, identical "process still alive", identical "next
+  request works" — which is exactly the blind spot that let the row's *first* design (the
+  `HelixRack._debug_panic` module-function one, described above) silently land in the wrong code path
+  without failing. Fixed by having `spec/support/phase7_server_helper.rb` capture the subprocess's
+  real stderr to a file instead of discarding it (`File::NULL`), and the gate spec now asserts each
+  row's `log_fault` output too (`"request handler panicked"` for the panic row, `"request failed"` for
+  the other two) — the response alone is no longer treated as sufficient proof.
+- **One finding, originally deferred, fixed instead after CodeRabbit flagged it independently as
+  Major on the same PR:** `engine::connection::handle` never special-cased `HEAD` requests — it wrote
+  a response's body unconditionally regardless of method — so a `HEAD` request that hit
+  `error_response()`'s new 22-byte body (where the pre-Phase-7 error path returned an empty one) wrote
+  bytes a `HEAD` response must not carry (RFC 9110 section 9.3.2), desyncing keep-alive framing for
+  the next request on that connection. The gap itself is general (any `HEAD` request to any handler
+  with a non-empty body hits it, not just the fault path) and this diff is only what made it easy to
+  hit in practice, not its root cause — genuinely `connection::handle`'s to fix, and this Resolution
+  note first said so, deferring it to Phase 11. Fixed here anyway once a second, independent reviewer
+  (CodeRabbit) flagged the same gap unprompted and called it Major: two independent findings on one
+  contained, well-understood bug outweighed the "narrowed scope" argument for leaving it. The fix
+  (`connection::handle`): keep `ensure_framing`'s `Content-Length` computation unchanged, skip the
+  `write_body` call for `HEAD`. New regression test,
+  `engine/tests/head_request_body_suppression.rs`, sends a `HEAD` request that would carry a non-empty
+  body followed by a `GET` on the *same* connection — the second response only comes back byte-exact
+  if the first one didn't desync the connection, which is the actual failure mode this bug produces,
+  not just "the HEAD response looked wrong in isolation".
+
 ## Phase 8 — Graceful shutdown (RNF05)
 
 SIGTERM/SIGINT: stop accepting, drain in-flight requests within a grace period, exit.
