@@ -7,23 +7,41 @@ use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use helixrack_engine::{serve, ConnectionCounter, Handler, HandlerResponse, ParsedRequest, ResponseBody};
 
 /// The exact bytes the Phase 1 fixed response is expected to be, for every
-/// request in the fixture corpus and every request in the keep-alive run.
+/// request in the fixture corpus and every non-final request in a
+/// keep-alive run.
 ///
 /// PLAN.md / PRD.md do not pin down the literal response bytes -- only that
 /// `GET /` gets "a fixed 200 response". This constant is the gate's concrete
 /// choice for what that response is; the phase-builder implementation must
 /// match it byte-for-byte.
 ///
+/// No `Connection` header (unlike earlier phases' version of this constant):
+/// since Phase 4 (see `PLAN.md`'s Phase 4 "Architecture note"), the engine
+/// is the sole source of truth for that header, stripping anything a
+/// `Handler` sets -- `FixedResponseHandler` below no longer sets one, and
+/// the engine adds none on a normal (non-final, non-idle-timeout) response.
+///
 /// Unused by `request_size_limit.rs` (it expects a 431, not this); since
 /// this module is compiled once per integration-test binary, that binary
 /// sees it as unused.
 #[allow(dead_code)]
-pub const EXPECTED_RESPONSE: &[u8] =
-    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK";
+pub const EXPECTED_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+
+/// `spawn_server()`'s default `max_keepalive` -- large enough that none of
+/// the Phase 1-3 gates (which send at most a handful of requests per
+/// connection and know nothing about this phase's max-keepalive behavior)
+/// could ever hit it.
+const DEFAULT_MAX_KEEPALIVE: usize = 1_000_000;
+
+/// `spawn_server()`'s default `keep_alive_timeout` -- long enough that none
+/// of the Phase 1-3 gates (which run in well under a second) could ever hit
+/// it.
+const DEFAULT_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// A `Handler` that ignores the request and always returns the exact
 /// response `EXPECTED_RESPONSE` is made of.
@@ -32,17 +50,15 @@ pub const EXPECTED_RESPONSE: &[u8] =
 /// existed (Phase 2, see `PLAN.md`) and assert on `EXPECTED_RESPONSE`
 /// byte-for-byte; this handler is what lets `spawn_server` keep producing
 /// exactly that response through the now-pluggable `serve`/`handle`, so
-/// those gates keep passing unchanged.
+/// those gates keep passing unchanged. Since Phase 4, it no longer sets its
+/// own `Connection` header -- see `EXPECTED_RESPONSE`'s doc comment.
 struct FixedResponseHandler;
 
 impl Handler for FixedResponseHandler {
     fn call(&self, _req: &ParsedRequest<'_>) -> HandlerResponse {
         HandlerResponse {
             status: 200,
-            headers: vec![
-                ("Content-Length".to_string(), "2".to_string()),
-                ("Connection".to_string(), "keep-alive".to_string()),
-            ],
+            headers: vec![("Content-Length".to_string(), "2".to_string())],
             body: ResponseBody::InMemory(b"OK".to_vec()),
         }
     }
@@ -65,9 +81,22 @@ pub struct TestServer {
 /// PRD.md section 5's single-threaded-runtime architecture), and returns
 /// immediately with the address to connect to.
 ///
+/// Uses [`DEFAULT_MAX_KEEPALIVE`]/[`DEFAULT_KEEP_ALIVE_TIMEOUT`] -- see
+/// [`spawn_server_with`] for a variant that lets a Phase 4 gate configure
+/// either knob.
+///
 /// The spawned thread is intentionally not joined: `serve` never returns
 /// for the life of the test process, so there's nothing to join on.
+#[allow(dead_code)]
 pub fn spawn_server() -> TestServer {
+    spawn_server_with(DEFAULT_MAX_KEEPALIVE, DEFAULT_KEEP_ALIVE_TIMEOUT)
+}
+
+/// Same as [`spawn_server`], but lets the caller configure `max_keepalive`
+/// and `keep_alive_timeout` (see `PLAN.md`'s Phase 4 "Gate") instead of
+/// getting the Phase 1-3-safe defaults.
+#[allow(dead_code)]
+pub fn spawn_server_with(max_keepalive: usize, keep_alive_timeout: Duration) -> TestServer {
     let std_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind ephemeral test port");
     let addr = std_listener
         .local_addr()
@@ -82,6 +111,7 @@ pub fn spawn_server() -> TestServer {
     thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
+            .enable_time()
             .build()
             .expect("build current_thread Tokio runtime for test server");
 
@@ -106,6 +136,8 @@ pub fn spawn_server() -> TestServer {
                 tokio_listener,
                 connections_for_thread,
                 Rc::new(FixedResponseHandler),
+                max_keepalive,
+                keep_alive_timeout,
             )
             .await
         }));

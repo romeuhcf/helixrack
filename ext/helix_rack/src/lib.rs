@@ -501,18 +501,44 @@ fn read_body(ruby: &Ruby, body: Value) -> Result<ResponseBody, Error> {
     }))
 }
 
-/// `HelixRack._serve_native(app, port, bind)` (see `lib/helix_rack.rb`):
-/// binds a TCP listener on `bind`:`port` and runs `engine::serve` to
-/// completion, blocking the calling (Ruby-owning) thread for as long as it
-/// runs -- see this module's top doc comment for why that's correct for
-/// this phase.
-fn _serve_native(ruby: &Ruby, app: Value, port: i64, bind: String) -> Result<(), Error> {
+/// `HelixRack._serve_native(app, port, bind, keep_alive_timeout,
+/// max_keepalive)` (see `lib/helix_rack.rb`): binds a TCP listener on
+/// `bind`:`port` and runs `engine::serve` to completion, blocking the
+/// calling (Ruby-owning) thread for as long as it runs -- see this module's
+/// top doc comment for why that's correct for this phase.
+///
+/// `keep_alive_timeout_seconds` and `max_keepalive` implement `PLAN.md`'s
+/// Phase 4 (PRD.md section 6.2's `--keep-alive-timeout`/`--max-keepalive`
+/// CLI flags, threaded here from `exe/helix_rack` via `lib/helix_rack.rb`) --
+/// see `engine::serve`/`connection::handle`'s doc comments for their exact
+/// semantics; this function only converts and forwards them.
+fn _serve_native(
+    ruby: &Ruby,
+    app: Value,
+    port: i64,
+    bind: String,
+    keep_alive_timeout_seconds: i64,
+    max_keepalive: i64,
+) -> Result<(), Error> {
     let port = u16::try_from(port).map_err(|_| {
         Error::new(
             ruby.exception_arg_error(),
             format!("port {port} is not a valid TCP port (0-65535)"),
         )
     })?;
+    let keep_alive_timeout_seconds = u64::try_from(keep_alive_timeout_seconds).map_err(|_| {
+        Error::new(
+            ruby.exception_arg_error(),
+            format!("keep_alive_timeout {keep_alive_timeout_seconds} must not be negative"),
+        )
+    })?;
+    let max_keepalive = usize::try_from(max_keepalive).map_err(|_| {
+        Error::new(
+            ruby.exception_arg_error(),
+            format!("max_keepalive {max_keepalive} must not be negative"),
+        )
+    })?;
+    let keep_alive_timeout = Duration::from_secs(keep_alive_timeout_seconds);
 
     let handler: Rc<dyn Handler> = Rc::new(RackAppHandler::new(ruby, app, port)?);
     let connections = Arc::new(ConnectionCounter::new());
@@ -539,7 +565,7 @@ fn _serve_native(ruby: &Ruby, app: Value, port: i64, bind: String) -> Result<(),
         runtime.block_on(local_set.run_until(async move {
             let listener = tokio::net::TcpListener::bind((bind.as_str(), port)).await?;
             tokio::select! {
-                res = serve(listener, connections, handler) => res,
+                res = serve(listener, connections, handler, max_keepalive, keep_alive_timeout) => res,
                 () = cancelled(cancel) => Ok(()),
             }
         }))
@@ -562,7 +588,7 @@ async fn cancelled(cancel: &AtomicBool) {
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
     let module = ruby.define_module("HelixRack")?;
-    module.define_module_function("_serve_native", magnus::function!(_serve_native, 3))?;
+    module.define_module_function("_serve_native", magnus::function!(_serve_native, 5))?;
     Ok(())
 }
 

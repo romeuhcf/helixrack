@@ -5,13 +5,14 @@ require "optparse"
 require "rack"
 require "helix_rack"
 
-# PRD.md section 6.2's Phase-2-relevant flags only (-a/-p/-b): --keep-alive-timeout,
-# --max-keepalive and --cpu-time-slice belong to Phase 4 and Phase 6 respectively and
-# are not implemented yet.
+# PRD.md section 6.2's Phase-2/Phase-4-relevant flags (-a/-p/-b, --keep-alive-timeout,
+# --max-keepalive): --cpu-time-slice belongs to Phase 6 and is not implemented yet.
 options = {
   app: "config.ru",
   port: 8080,
-  bind: "0.0.0.0"
+  bind: "0.0.0.0",
+  keep_alive_timeout: 15,
+  max_keepalive: 10_000
 }
 
 OptionParser.new do |parser|
@@ -25,7 +26,24 @@ OptionParser.new do |parser|
   parser.on("-b", "--bind HOST", "Network interface IP to bind to (default: 0.0.0.0)") do |v|
     options[:bind] = v
   end
+  parser.on(
+    "--keep-alive-timeout SECONDS", Integer,
+    "Timeout in seconds for closing idle connections (default: 15)"
+  ) do |v|
+    options[:keep_alive_timeout] = v
+  end
+  parser.on(
+    "--max-keepalive N", Integer,
+    "Maximum requests per TCP connection before forced close (default: 10000)"
+  ) do |v|
+    options[:max_keepalive] = v
+  end
 end.parse!(ARGV)
 
 app = Rack::Builder.parse_file(options[:app])
-HelixRack.serve(app, options[:port], bind: options[:bind])
+HelixRack.serve(
+  app, options[:port],
+  bind: options[:bind],
+  keep_alive_timeout: options[:keep_alive_timeout],
+  max_keepalive: options[:max_keepalive]
+)

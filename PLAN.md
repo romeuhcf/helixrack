@@ -178,9 +178,13 @@ back from `Handler::call` -- not something `Handler`/`ext/helix_rack` needs to k
 - Idle timeout: set timeout to a small fixed value (e.g. 500 ms), open a connection, send
   nothing, assert the socket receives EOF within `[timeout, timeout + fixed epsilon]` measured by
   a monotonic clock in the test — bounded-tolerance, still deterministic pass/fail. Applies only
-  to a genuinely idle connection (no bytes of a new request buffered yet) — a client mid-request,
-  trickling header/body bytes slowly, is Phase 1's `MAX_BUF_CAPACITY`/`MAX_BODY_CAPACITY` Slowloris
-  guards' concern, not this timeout's.
+  to a genuinely idle connection (no bytes of a new request buffered yet). A client mid-request,
+  trickling header/body bytes slowly, is **not** covered by this timeout or fully covered by
+  anything else: Phase 1's `MAX_BUF_CAPACITY`/`MAX_BODY_CAPACITY` bound how much such a client can
+  make the connection *buffer*, not how long it can take to send it — a client sending one byte
+  then going silent trips neither cap. Confirmed as a real gap by this phase's safety review, left
+  open deliberately: PRD.md's `--keep-alive-timeout` is specified as bounding idle connections, not
+  slow ones, so this is its own future hardening item, not something to fold into this flag.
 
 ## Phase 5 — GVL release discipline (RF06)
 
