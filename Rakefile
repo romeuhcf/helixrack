@@ -83,7 +83,21 @@ task "gem:native" do
   # hardcoded (the change reverted above) -- `native:x86_64-linux` names the
   # platform explicitly, matching the shape `RUBY_TARGET`-driven task
   # definition actually produces.
-  command = "bundle && RUBY_TARGET=x86_64-linux RUBY_CC_VERSION=#{ruby_versions} rake native:x86_64-linux gem"
+  # `bundle exec rake`, not plain `rake` -- confirmed necessary the hard way:
+  # plain `rake` here raised `LoadError: cannot load such file --
+  # rspec/core/rake_task` (this Rakefile's own line 4) in real CI, even
+  # immediately after the preceding `bundle` (install) reported success into
+  # `./vendor/bundle` -- the container's `rbenv` shim resolves plain `rake`
+  # against whichever cross-Ruby version it picks by default, not
+  # necessarily the one `bundle install` just populated, so it never saw the
+  # bundled gems. `bundle exec` removes the ambiguity outright. This
+  # Rakefile requiring `rspec`/`rubocop`'s rake tasks unconditionally at the
+  # top (pre-existing, not something this phase changed) is exactly what
+  # makes the gap visible -- a Rakefile with no such requires wouldn't hit
+  # this, which is presumably why `rake_compiler_dock`'s own docs show the
+  # plain form working.
+  command = "bundle && RUBY_TARGET=x86_64-linux RUBY_CC_VERSION=#{ruby_versions} " \
+            "bundle exec rake native:x86_64-linux gem"
   RakeCompilerDock.sh(command, platform: "x86_64-linux-gnu")
 end
 

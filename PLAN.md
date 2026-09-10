@@ -926,8 +926,24 @@ platform list (matching the existing `exclude: ["arm-linux", "x64-mingw32"]` pre
   `gem:native` opt into `x86_64-linux` the same way `cross-gem` itself does -- setting `RUBY_TARGET=
   x86_64-linux` in the container's own shell command and invoking the specific `native:x86_64-linux gem`
   task, not the generic `cross native gem` (which had only worked because of the now-reverted static
-  override). Re-dispatching `build-gems.yml` after this fix, to confirm every other platform builds
-  cleanly again before merging, is the next step -- not yet confirmed as this note is being written.
+  override). Re-dispatched `build-gems.yml` after this fix and confirmed: `x86_64-linux`, `aarch64-linux`,
+  `aarch64-mingw-ucrt`, `arm64-darwin`, `x86_64-darwin`, `x86_64-linux-musl`, and `aarch64-linux-musl` all
+  built cleanly (`arm-linux-musl` still fails, but that's Phase 10's already-documented, unrelated missing-
+  upstream-Docker-image issue, not this regression).
+- **A second, independent bug in `gem:native` itself**, found by the very same re-dispatch, still on
+  `verify-native-install`: `rake aborted! LoadError: cannot load such file -- rspec/core/rake_task`
+  (`Rakefile:4`, this project's pre-existing top-level `require`) -- right after the preceding `bundle`
+  (install) step reported success into `./vendor/bundle`. Root cause: the container's `rbenv` shim resolves
+  a *plain* `rake` invocation against whichever cross-Ruby version it defaults to, not necessarily the one
+  `bundle install` just populated -- so the immediately-following `rake native:x86_64-linux gem` (chained
+  with `&&`, not `bundle exec`) never saw the bundled gems. Fixed by making that `bundle exec rake ...`
+  explicitly, removing the ambiguity outright. This project's Rakefile requiring `rspec`/`rubocop`'s rake
+  tasks unconditionally at the top (not something this phase changed) is what made the gap visible -- a
+  Rakefile without those requires wouldn't hit this, plausibly why `rake_compiler_dock`'s own documented
+  example (`RakeCompilerDock.sh 'bundle && rake cross native gem'`) shows the plain form working. Re-ran
+  `bundle exec rake gem:native` and `bundle exec rspec spec/integration/phase12_native_gem_spec.rb` locally
+  after this fix and confirmed both pass; a further CI re-dispatch is what will confirm
+  `verify-native-install` itself now passes end to end.
 - **The gate itself is `spec/integration/phase12_native_gem_spec.rb`**, a real `docker run` against a
   plain `ruby:3.4-slim` image (confirmed to have no `gcc`/`cc`/`cargo`/`rustc`/`make`), asserting the exact
   `gem install` exit code, `helix_rack --version`/`--help` output and exit codes, all inside that
