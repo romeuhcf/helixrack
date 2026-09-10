@@ -912,6 +912,22 @@ platform list (matching the existing `exclude: ["arm-linux", "x64-mingw32"]` pre
   image has no Rust toolchain at all (confirmed directly: no `cargo` binary anywhere in it), and the
   `rbsys/<platform>` image family (the one `oxidize-rb/actions/cross-gem@v1` already uses in CI) has to be
   requested explicitly.
+- **A real regression, caught by dispatching `build-gems.yml` before merging, not after** (the same
+  discipline Phase 10 established): a first version of `gem:native` set `ext.cross_platform =
+  ["x86_64-linux"]` directly on the shared `RbSys::ExtensionTask` in `Rakefile`, reasoning (wrongly) that
+  merely *defining* the `cross`/`native:x86_64-linux` tasks couldn't affect anything else. Dispatching
+  `build-gems.yml` on this branch showed otherwise: `x86_64-linux` built fine, but every *other* platform's
+  `cross-gem` matrix job failed with `Don't know how to build task 'native:aarch64-linux'` (and similar) --
+  `RbSys::ExtensionTask#init` computes `cross_platform` dynamically from `ENV["RUBY_TARGET"]`
+  (`[ENV["RUBY_TARGET"]].compact`, read directly from `rb_sys`'s own source), which is exactly what
+  `oxidize-rb/actions/cross-gem@v1` relies on for every platform it builds (setting `RUBY_TARGET` itself,
+  per invocation) -- a static override in the Rakefile shadows that unconditionally, for every platform at
+  once, not just the one `gem:native` cared about. Fixed by removing the override entirely and having
+  `gem:native` opt into `x86_64-linux` the same way `cross-gem` itself does -- setting `RUBY_TARGET=
+  x86_64-linux` in the container's own shell command and invoking the specific `native:x86_64-linux gem`
+  task, not the generic `cross native gem` (which had only worked because of the now-reverted static
+  override). Re-dispatching `build-gems.yml` after this fix, to confirm every other platform builds
+  cleanly again before merging, is the next step -- not yet confirmed as this note is being written.
 - **The gate itself is `spec/integration/phase12_native_gem_spec.rb`**, a real `docker run` against a
   plain `ruby:3.4-slim` image (confirmed to have no `gcc`/`cc`/`cargo`/`rustc`/`make`), asserting the exact
   `gem install` exit code, `helix_rack --version`/`--help` output and exit codes, all inside that

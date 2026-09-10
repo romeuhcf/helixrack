@@ -17,15 +17,20 @@ GEMSPEC = Gem::Specification.load("helix_rack.gemspec")
 
 RbSys::ExtensionTask.new("helix_rack", GEMSPEC) do |ext|
   ext.lib_dir = "lib/helix_rack"
-  # Phase 12 (PLAN.md, Phase 12): only *defines* the `cross`/`native:x86_64-linux`
-  # tasks `RakeCompilerDock.sh` (Rakefile's `gem:native` task, below) drives
-  # inside a real rake-compiler-dock container -- this line alone changes
-  # nothing about the plain `rake compile`/`bundle exec rake` loop every
-  # prior phase's tests depend on. Confirmed by reading rake-compiler's own
-  # `extensiontask.rb`: the prerequisite-rewiring that could affect `compile`
-  # only happens inside the `task 'cross' do ... end` body, which only runs
-  # when the `cross` task itself is explicitly invoked, not merely defined.
-  ext.cross_platform = ["x86_64-linux"]
+  # Deliberately *not* setting `ext.cross_platform` here (a first version of
+  # this phase's change did, unconditionally, to `["x86_64-linux"]`, and it
+  # broke every other platform's build in real CI -- see the postmortem in
+  # PLAN.md's Phase 12 Resolution note for the full story). `RbSys::
+  # ExtensionTask#init` already computes it dynamically, from
+  # `ENV["RUBY_TARGET"]` (`[ENV["RUBY_TARGET"]].compact`, read directly from
+  # rb_sys's own source) -- `.github/workflows/build-gems.yml`'s
+  # `oxidize-rb/actions/cross-gem@v1` step relies on exactly that per-platform
+  # default to build every OTHER target platform (it sets `RUBY_TARGET`
+  # itself, per invocation), and a static override here shadows it
+  # unconditionally, for every platform, not just the one this phase's own
+  # `gem:native` task cares about. `gem:native` (below) opts into a single
+  # platform the same way `cross-gem` itself does -- via `RUBY_TARGET`, not
+  # by touching this file's own config.
 end
 
 require "rake_compiler_dock"
@@ -67,7 +72,19 @@ task "gem:native" do
   # and building unconditionally for all of them is exactly what surfaced
   # the gemspec's `required_ruby_version` being wrong in the first place.
   ruby_versions = "3.3.11:3.4.9:4.0.2"
-  RakeCompilerDock.sh("bundle && RUBY_CC_VERSION=#{ruby_versions} rake cross native gem", platform: "x86_64-linux-gnu")
+  # `RUBY_TARGET=x86_64-linux`, also set inside the container's own shell
+  # command for the same reason `RUBY_CC_VERSION` is above -- this is the
+  # same env var `RbSys::ExtensionTask#init` reads to compute
+  # `cross_platform` dynamically (see this file's own comment on that, just
+  # above), so this opts into building for x86_64-linux only without
+  # touching that shared, static config. `rake native:x86_64-linux gem`, not
+  # the generic `rake cross native gem` a first version of this task used:
+  # the generic form only worked because `cross_platform` used to be
+  # hardcoded (the change reverted above) -- `native:x86_64-linux` names the
+  # platform explicitly, matching the shape `RUBY_TARGET`-driven task
+  # definition actually produces.
+  command = "bundle && RUBY_TARGET=x86_64-linux RUBY_CC_VERSION=#{ruby_versions} rake native:x86_64-linux gem"
+  RakeCompilerDock.sh(command, platform: "x86_64-linux-gnu")
 end
 
 task default: %i[compile spec rubocop]
