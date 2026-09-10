@@ -9,6 +9,13 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
+# Forwards to `helixrack-engine`'s own feature of the same name (off by
+# default) -- enable with `RB_SYS_CARGO_FEATURES=combine-write` at build time
+# (see `rb_sys/mkmf.rb`'s `RB_SYS_CARGO_FEATURES` override) to build the
+# opt-in head+body single-write path instead of the default two-write one.
+[features]
+combine-write = ["helixrack-engine/combine-write"]
+
 [dependencies]
 magnus = { version = "0.8.2" }
 rb-sys = { version = "0.9", features = ["stable-api-compiled-fallback"] }

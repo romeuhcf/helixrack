@@ -11,6 +11,11 @@ description = "Phase 1: raw HTTP/1.1 engine (Tokio current_thread + httparse), n
 name = "helixrack_engine"
 path = "src/lib.rs"
 
+# Off by default -- see `write_response`'s doc comment in `src/connection.rs`
+# for what this changes and why it's a feature, not an unconditional change.
+[features]
+combine-write = []
+
 [dependencies]
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "fs", "sync"] }
 httparse = "1"

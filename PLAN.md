@@ -1182,6 +1182,70 @@ on its own branch/PR, not folded back into Phase 13's own history)**:
   thread queueing cost this phase's own Root cause analysis above already identified -- fixing that
   for real still means the multi-worker/multi-threaded redesign already flagged as out of scope here.
 
+**Second post-Phase-13 follow-up: `combine-write`, an opt-in Cargo feature (a further, smaller lever
+on top of `TCP_NODELAY`, kept feature-gated rather than made the default -- see below for why)**:
+
+- **Finding**: even with `TCP_NODELAY` on, `engine/src/connection.rs` still writes a response as two
+  separate `write_all` calls (head, then body). Nagle no longer *coalesces* them, but that cuts both
+  ways: two calls now typically produce two separate TCP segments instead of one, where one `write_all`
+  over a concatenated head+body buffer would still be a single syscall and (usually) a single segment.
+- **Fix, built as a feature specifically so it could be measured against the default-off baseline
+  independently, per instruction, rather than folded in unconditionally**: `combine-write`, declared in
+  both `engine/Cargo.toml` and `ext/helix_rack/Cargo.toml` (the latter forwarding to the former), off by
+  default. `engine/src/connection.rs`'s call site now dispatches to one of two `#[cfg]`-gated
+  `write_response` implementations: feature off (default, unchanged) writes head then body separately;
+  feature on concatenates head with a `ResponseBody::InMemory` body into one buffer and does a single
+  `write_all` -- `ResponseBody::Spooled` (a large, file-backed body) keeps the unconditional two-step
+  path in both cases, since reading a potentially multi-hundred-MB spooled body into memory just to
+  concatenate it with the head would defeat the entire reason that variant exists.
+- **Getting the env-var override actually wired up was its own real finding**: `rb_sys/mkmf.rb`'s
+  documented `RB_SYS_CARGO_FEATURES` Makefile-level override only takes effect on a `--features` flag
+  the generated cargo command already has -- verified by reading `rb_sys`'s own `cargo_builder.rb`
+  (`cmd += ["--features", features.join(",")] unless features.empty?`): with `extconf.rb`'s
+  `create_rust_makefile` called with no block (this project's state before this follow-up), `builder.
+  features` stayed `[]`, so no `--features` flag was ever emitted for the override to latch onto -- the
+  Makefile carried a dead `RB_SYS_CARGO_FEATURES ?=` line that nothing downstream ever read. Confirmed
+  directly: a first `RB_SYS_CARGO_FEATURES=combine-write bundle exec rake compile` produced an identical
+  cargo invocation to a plain one, no `--features` anywhere in it. Fixed by having `extconf.rb` itself
+  read `ENV.fetch("RB_SYS_CARGO_FEATURES", "").split(",")` into `r.features` -- the flag `rake compile`
+  embeds is decided at extconf-time from this process's own environment, sidestepping the broken
+  Makefile-level override entirely. `bench/Dockerfile` gained a matching `ARG`/`ENV RB_SYS_CARGO_FEATURES`
+  pair so the bench image can be built either way, and `bench/run.rb` gained `BENCH_CARGO_FEATURES`
+  (tags a distinct image per feature set, passes `--build-arg`, and records the feature set actually
+  built in `report.md`'s own header) so the two variants are testable independently through the same
+  harness and methodology, not a one-off throwaway script.
+- **Verified independently, not just built**: `cargo test --manifest-path engine/Cargo.toml`, run once
+  with default features and once with `--features combine-write` -- identical pass results on every
+  test, including `fixture_corpus_maps_byte_exact_to_expected_response` (byte-exact HTTP output), proving
+  the two code paths produce the same bytes on the wire, not just "both compile." `bundle exec rspec` x3
+  against a clean `RB_SYS_CARGO_FEATURES=combine-write bundle exec rake compile` build, separately from
+  x3 against a clean default build: 0 failures either way.
+- **Measured with a scoped, back-to-back A/B run** (`BENCH_SERVERS=helix_rack BENCH_SCENARIOS=hello_world,
+  io_mixed`, same N=10/VUS=50/15s methodology, `combine-write` off then on, run immediately one after the
+  other specifically so both arms shared roughly the same machine conditions -- this session's host was
+  measurably noisier at the time of this specific comparison than during the `TCP_NODELAY` measurement
+  above, e.g. the off-arm's own `hello_world` median (76.73ms) is well above that earlier clean run's
+  8.12ms; stated honestly rather than treated as a regression, since it's a same-run, same-conditions
+  comparison, not a cross-run one):
+
+  | scenario | combine-write | P99 median (ms) | P99 range | RSS median (MiB) |
+  |---|---|---|---|---|
+  | hello_world | off | 76.73 | 17.34-105.7 | 25.1 |
+  | hello_world | on | 13.68 | 12.43-47.34 | 26.5 |
+  | io_mixed | off | 67.01 | 42.09-151.97 | 56.9 |
+  | io_mixed | on | 51.84 | 35.44-80.84 | 55.4 |
+
+  `hello_world` p99 dropped ~82% (a single small in-memory body, response size dominated by per-request
+  overhead, exactly where one fewer syscall/segment matters most); `io_mixed` dropped ~23% (a real
+  Postgres round trip dominates that scenario's latency, so the same fixed per-request saving is a
+  smaller fraction of the total). RSS unaffected either way, as expected -- this changes write-syscall
+  count, not allocation behavior.
+- **Left feature-gated, not flipped to the default, for now**: the result is real and consistent in
+  direction across both scenarios, but this specific A/B run's noisier host conditions (noted above)
+  make its *absolute* magnitude less trustworthy than the controlled `TCP_NODELAY` measurement was --
+  worth re-confirming on a quieter run (or folding into the next full Phase 13-style gate re-run)
+  before promoting it from opt-in to unconditional.
+
 ## Dependency order
 
 Phases 0-4 are strictly sequential (each is the substrate for the next). 5, 6, 7, 8 can happen in
