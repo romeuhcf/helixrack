@@ -58,6 +58,61 @@ use helixrack_engine::{
     probe_io_backend, serve, ConnectionCounter, Handler, HandlerResponse, ParsedRequest, ResponseBody,
 };
 
+/// Phase 10 (`PLAN.md`, Phase 10/RNF03): every Rust-side heap allocation in
+/// this crate (and in `helixrack_engine`, since Rust's global allocator is
+/// artifact-wide, not per-crate) goes through mimalloc instead of the
+/// platform default (glibc `malloc` on Linux) from here on. "Artifact-wide"
+/// on purpose, not "process-wide": this only reaches allocations made
+/// *inside this `cdylib`*. A second, unrelated Rust Ruby extension `dlopen`'d
+/// into the same host process keeps its own `#[global_allocator]` (or the
+/// platform default) entirely -- `#[global_allocator]` binds once per linked
+/// artifact, not once per OS process.
+///
+/// `#[global_allocator]` can only be set once, in the crate that produces
+/// the final linked artifact -- here, that's this crate's own `cdylib`
+/// (`helix_rack.so`), not `engine` (a plain `rlib` dependency, which has no
+/// artifact of its own for this attribute to apply to).
+///
+/// **Scope, stated plainly rather than left to sound broader than it is:**
+/// this affects this extension's *own* Rust-side allocations -- the
+/// `Vec<u8>`/`String`/`Box` traffic `engine::connection`'s HTTP parsing,
+/// buffering, and response construction does, which is exactly where this
+/// project's own allocation churn happens (PRD.md RNF03's stated goal:
+/// avoiding heap fragmentation for the server's own memory footprint). It
+/// does **not** replace Ruby's own object allocator -- CRuby's VALUE heap
+/// is its own GC-managed arena/slab system, not a thin wrapper over libc
+/// `malloc` calls this attribute could intercept, and this diff does not
+/// attempt the considerably more invasive step of overriding the
+/// process-wide C `malloc` symbol itself (which a dlopen'd extension *can*
+/// do via symbol interposition, but doing it soundly -- for a shared
+/// library loaded into an already-running process with its own allocator
+/// already active, not a standalone binary -- was judged out of scope for
+/// this phase's real, achievable deliverable).
+///
+/// **Two known, accepted gaps**, surfaced by this phase's safety review and
+/// recorded here rather than fixed, since neither is this project's own
+/// regression -- both are pre-existing properties of adding *any*
+/// `#[global_allocator]` (mimalloc or otherwise) to a Ruby C extension, not
+/// something this diff introduces:
+/// - **Fork safety.** This crate registers no `pthread_atfork` handler.
+///   mimalloc's own allocator state (its heap/segment/page structures) is
+///   not guaranteed fork-safe by default without one -- a process that
+///   `fork()`s (CRuby's own `Process.fork`, or a pre-fork server like
+///   Puma/Unicorn) while another thread holds an internal mimalloc lock can
+///   leave the child with a permanently wedged allocator. Out of scope for
+///   this phase: this project's own gate (Phase 2 onward) never forks, and a
+///   correct fix means auditing every deployment topology this extension
+///   could be loaded into, not a one-line change here.
+/// - **Debug-build corruption detection.** mimalloc's own double-free/heap-
+///   corruption detection is compiled out at `MI_DEBUG=0` (the default for
+///   the `mimalloc` crate's non-`debug`-featured release build used here),
+///   trading a security-relevant diagnostic for the release-mode speed
+///   RNF03 is asking for. The `debug`/`debug_in_debug` Cargo features exist
+///   precisely for turning this back on when investigating a suspected
+///   corruption bug, at a real performance cost -- not enabled by default.
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Minimal `rb_thread_call_without_gvl`/`rb_thread_call_with_gvl` wrappers
 /// (see this module's top doc comment for why they're here). Neither is
 /// wrapped by magnus 0.8.2 itself -- both are listed, unimplemented, among

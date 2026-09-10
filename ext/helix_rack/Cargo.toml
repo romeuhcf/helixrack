@@ -15,6 +15,19 @@ rb-sys = { version = "0.9", features = ["stable-api-compiled-fallback"] }
 helixrack-engine = { path = "../../engine" }
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros"] }
 tempfile = "3"
+mimalloc = "0.1.52"
+# `local_dynamic_tls` isn't exposed through `mimalloc`'s own `[features]`
+# table (only `debug`/`debug_in_debug` are) -- only through
+# `libmimalloc-sys`'s, which this depends on directly, purely to enable it;
+# Cargo's feature unification applies it to the same `libmimalloc-sys`
+# instance `mimalloc` itself pulls in. See `GLOBAL_ALLOCATOR`'s doc comment
+# in src/lib.rs for the safety-review finding this fixes: without it,
+# mimalloc's C code compiles with `-ftls-model=initial-exec`, which shares a
+# small, process-wide static-TLS budget with every other `dlopen`'d library
+# -- verified to be able to make a later `require` in the same process fail
+# outright with "cannot allocate memory in static TLS block", not just
+# degrade.
+libmimalloc-sys = { version = "0.1.49", features = ["local_dynamic_tls"] }
 
 [build-dependencies]
 rb-sys-env = "0.2.2"
