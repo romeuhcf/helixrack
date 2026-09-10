@@ -333,7 +333,6 @@ pub(crate) async fn handle(
             }
 
             let head = serialize_head(&response);
-            socket.write_all(&head).await?;
             // HTTP/1.1 (RFC 9110 section 9.3.2): a response to `HEAD` must
             // carry the same header fields a `GET` would (so `ensure_framing`
             // above still ran, and `Content-Length` above still reflects the
@@ -347,8 +346,10 @@ pub(crate) async fn handle(
             // bytes the client doesn't expect there, which the client then
             // misreads as the start of the *next* response on the same
             // persistent connection -- silent desync, not a clean error.
-            if !is_head {
-                write_body(&mut socket, &response.body).await?;
+            if is_head {
+                socket.write_all(&head).await?;
+            } else {
+                write_response(&mut socket, head, &response.body).await?;
             }
             drop(in_flight);
 
@@ -554,6 +555,59 @@ fn serialize_head(response: &HandlerResponse) -> Vec<u8> {
 /// a noticeable stretch on a single-threaded runtime (PRD.md RNF01) --
 /// 64 KiB-256 KiB is the generally reasonable range for this tradeoff, and
 /// 128 KiB is the middle of it.
+/// Writes a response's head and (non-`HEAD`-suppressed) body to `socket`.
+///
+/// Gated behind the opt-in `combine-write` Cargo feature (off by default),
+/// added as a follow-up to the `TCP_NODELAY` fix (see `PLAN.md`'s Phase 13
+/// "Post-Phase-13 follow-up" notes): with Nagle disabled, two back-to-back
+/// `write_all` calls (head, then body) typically go out as two separate TCP
+/// segments instead of coalescing, so combining them into one `write_all`
+/// is a real, if smaller, lever on top of that fix -- one syscall and one
+/// segment instead of two, for the common case. Built as a feature, not an
+/// unconditional change, specifically so its effect can be measured against
+/// the `combine-write`-off baseline independently of the `TCP_NODELAY` fix,
+/// rather than assumed.
+///
+/// Only [`ResponseBody::InMemory`] can be combined this way: concatenating
+/// head and body into one buffer before writing is exactly the small-body
+/// case this is for. [`ResponseBody::Spooled`] keeps its own
+/// `write_head` + streamed-chunk path unconditionally -- reading a
+/// potentially multi-hundred-MB spooled body into memory just to concatenate
+/// it with the head would defeat the entire reason [`ResponseBody::Spooled`]
+/// exists.
+#[cfg(feature = "combine-write")]
+async fn write_response(
+    socket: &mut TcpStream,
+    head: Vec<u8>,
+    body: &ResponseBody,
+) -> io::Result<()> {
+    match body {
+        ResponseBody::InMemory(bytes) => {
+            let mut combined = head;
+            combined.extend_from_slice(bytes);
+            socket.write_all(&combined).await
+        }
+        ResponseBody::Spooled(_) => {
+            socket.write_all(&head).await?;
+            write_body(socket, body).await
+        }
+    }
+}
+
+/// The default (`combine-write` feature off) path: head and body written as
+/// two separate `write_all` calls, unchanged since Phase 1/2. See the
+/// `combine-write`-gated [`write_response`] above for the alternative this
+/// is being measured against.
+#[cfg(not(feature = "combine-write"))]
+async fn write_response(
+    socket: &mut TcpStream,
+    head: Vec<u8>,
+    body: &ResponseBody,
+) -> io::Result<()> {
+    socket.write_all(&head).await?;
+    write_body(socket, body).await
+}
+
 const SPOOLED_BODY_CHUNK_SIZE: usize = 128 * 1024;
 
 /// Writes a [`HandlerResponse`]'s body to `socket`: [`ResponseBody::InMemory`]

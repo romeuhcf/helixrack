@@ -31,7 +31,16 @@ require "net/http"
 require "timeout"
 
 module Bench
-  IMAGE = "helixrack-bench:latest"
+  # Comma-separated Cargo features to build the `helix_rack` extension with
+  # inside the bench image (e.g. `combine-write`, see `engine/src/
+  # connection.rs`'s `write_response`) -- empty (this project's real
+  # default) unless set, so a feature-gated optimization can be measured
+  # against the default-off baseline independently, with the same
+  # methodology, rather than assumed. A distinct image tag per feature set
+  # (not always `:latest`) avoids silently reusing a stale image built with
+  # a different feature set than the current run asked for.
+  CARGO_FEATURES = ENV.fetch("BENCH_CARGO_FEATURES", "")
+  IMAGE = CARGO_FEATURES.empty? ? "helixrack-bench:latest" : "helixrack-bench:features-#{CARGO_FEATURES.tr(",", "-")}"
   NETWORK = "helixrack-bench-net"
   POSTGRES_NAME = "helixrack-bench-postgres"
   SERVER_NAME = "helixrack-bench-server"
@@ -132,7 +141,10 @@ module Bench
   end
 
   def build_image
-    run!("docker", "build", "-f", "bench/Dockerfile", "-t", IMAGE, ".", chdir: REPO_ROOT)
+    cmd = ["docker", "build", "-f", "bench/Dockerfile", "-t", IMAGE]
+    cmd += ["--build-arg", "RB_SYS_CARGO_FEATURES=#{CARGO_FEATURES}"] unless CARGO_FEATURES.empty?
+    cmd << "."
+    run!(*cmd, chdir: REPO_ROOT)
   end
 
   def boot_server(server, scenario)
@@ -241,6 +253,7 @@ module Bench
 
     lines = ["# Phase 13 benchmark results", ""]
     lines << "N=#{N_RUNS} runs, VUS=#{VUS}, duration=#{DURATION}, cpus=#{CPUS}, memory=#{MEMORY}."
+    lines << "Cargo features: #{CARGO_FEATURES.empty? ? "(none -- default build)" : CARGO_FEATURES}"
     lines << "Container digest: #{capture("docker", "image", "inspect", "--format={{.Id}}", IMAGE).strip}"
     lines << ""
 

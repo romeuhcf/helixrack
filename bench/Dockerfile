@@ -28,6 +28,13 @@ RUN bundle install
 COPY exe exe
 COPY lib lib
 COPY Rakefile ./
+# Empty (default-off) unless the build is invoked with
+# `--build-arg RB_SYS_CARGO_FEATURES=...` -- see `bench/run.rb`'s
+# `BENCH_CARGO_FEATURES` for how this image is built with an opt-in Cargo
+# feature enabled, to measure it against the default-off baseline
+# independently (e.g. `engine/src/connection.rs`'s `combine-write`).
+ARG RB_SYS_CARGO_FEATURES=
+ENV RB_SYS_CARGO_FEATURES=${RB_SYS_CARGO_FEATURES}
 RUN bundle exec rake compile:release
 
 COPY bench/apps bench/apps
