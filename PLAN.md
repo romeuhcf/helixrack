@@ -711,10 +711,13 @@ what's linked. Deterministic yes/no, no runtime measurement needed.
      model by default via `libmimalloc-sys`'s own `build.rs`, consuming a small, artifact-wide static-TLS
      slot shared with every other `dlopen`'d library in the host Ruby process -- capable of making a
      *later, unrelated* `require`/`dlopen` in the same process fail outright with "cannot allocate memory
-     in static TLS block," not just degrade. Fixed by adding `libmimalloc-sys` as an explicit direct
-     dependency (`ext/helix_rack/Cargo.toml`) purely to enable its `local_dynamic_tls` feature -- not
-     re-exposed through the top-level `mimalloc` crate's own `[features]` table, so Cargo's feature
-     unification is what actually applies it to the shared instance `mimalloc` itself pulls in.
+     in static TLS block," not just degrade. Fixed by enabling `mimalloc`'s own `local_dynamic_tls`
+     feature (`ext/helix_rack/Cargo.toml`), which forwards straight through to `libmimalloc-sys`'s
+     feature of the same name -- an initial version of this fix added `libmimalloc-sys` as an
+     unnecessary explicit direct dependency, on the mistaken assumption that `mimalloc`'s own
+     `[features]` table only re-exposed `debug`/`debug_in_debug`; a CodeRabbit review comment on this
+     PR caught it, and checking the actual vendored 0.1.52 `Cargo.toml` confirmed `local_dynamic_tls =
+     ["libmimalloc-sys/local_dynamic_tls"]` is there, so the extra direct dependency was removed.
      Independently re-verified against the rebuilt `.so` with `readelf -Wr`: `TPOFF64` relocation count
      went from the reviewer's own measured nonzero baseline to 0; 8 `DTPMOD64`/`DTPOFF64` relocations
      remain (the safe general-dynamic-model kind); `nm | grep -c mi_malloc` confirmed mimalloc is still
@@ -732,15 +735,37 @@ what's linked. Deterministic yes/no, no runtime measurement needed.
      omitted `ruby-version`, which needs a committed `.ruby-version`/`.tool-versions` file to resolve a
      "default" version; this repo has neither (`main.yml`'s own equivalent step always passed an explicit
      `ruby-version: ${{ matrix.ruby }}`, so this codepath was never exercised there). Fixed by pinning
-     `ruby-version: '4.0.6'` explicitly in both steps, matching `main.yml`'s own pinned version. Re-run
-     after the fix to confirm.
+     `ruby-version: '4.0.6'` explicitly in both steps, matching `main.yml`'s own pinned version.
+     The re-run past that fix hit its default `fail-fast: true` matrix behavior: one platform
+     (`arm-linux-musl`) failed for a reason with nothing to do with this project -- `docker pull
+     rbsys/arm-linux-musl:0.9.128` itself 404s (`manifest unknown`), an upstream `oxidize-rb`/`rb_sys`
+     tooling image gap -- and that single failure cancelled every other platform's job before they even
+     started, hiding whether mimalloc itself cross-compiles cleanly anywhere. Added `fail-fast: false` to
+     let each platform run independently (a safe, generally-good change regardless of this phase). The
+     resulting full run was worth the cost: 8 of 10 platforms succeeded outright, including every platform
+     that actually matters for this project's own deployment target -- `x86_64-linux`, `aarch64-linux`,
+     `x86_64-linux-musl`, `aarch64-linux-musl`, `x86_64-darwin`, `arm64-darwin`, `aarch64-mingw-ucrt` --
+     and it surfaced a second, genuine (not infra-flake) finding: `x64-mingw-ucrt` (64-bit Windows via the
+     GNU mingw cross-toolchain) fails to compile mimalloc's vendored C source at all --
+     `error: 'ERROR_COMMITMENT_MINIMUM' undeclared` in `libmimalloc-sys`'s `prim/windows/prim.c`. Verified
+     this is a real, currently-unresolved upstream issue, not something specific to this project or a
+     stale local toolchain: the identical error, same undeclared symbol, same file, reproduces in an
+     unrelated project (`egui`) cross-compiling to `x86_64-pc-windows-gnu` with an earlier `libmimalloc-sys`
+     version (0.1.42) too (github.com/emilk/egui/issues/7033, open, no workaround posted) -- the mingw-w64
+     headers this cross-toolchain ships are missing a Windows SDK constant mimalloc's Windows code expects.
+     `aarch64-mingw-ucrt` succeeding regardless points to a different cross-compiler/header set for that
+     target, not a fix for this one. Not chased further here: this project's real deployment target is a
+     Linux/macOS server, `x64-mingw-ucrt` is one line in a cross-gem release-platform list, and Phase 12
+     ("Packaging") is the phase actually responsible for the native-gem release pipeline this finding
+     belongs to -- flagged there rather than solved piecemeal inside Phase 10's own allocator-integration
+     scope.
   3. **[Low, documented]** `Cargo.lock` is gitignored (`.gitignore:21`, a pre-existing, unmodified
      project choice -- matching how `rb_sys`-based extension gems typically avoid pinning dependents'
-     resolution), so a fresh `cargo build` re-resolves `mimalloc`/`libmimalloc-sys` versions each time
-     rather than reusing a locked graph. Both direct dependency declarations already narrow this in
-     practice -- `mimalloc = "0.1.52"` and `libmimalloc-sys = "0.1.49"` (`ext/helix_rack/Cargo.toml`) are
-     Cargo caret requirements, which on a pre-1.0 crate only admit patch-level bumps (`0.1.z`, `z` >= the
-     stated minimum), not a silent jump to a different vendored mimalloc *major* -- confirmed against the
+     resolution), so a fresh `cargo build` re-resolves `mimalloc` (and its `libmimalloc-sys` dependency)
+     each time rather than reusing a locked graph. The direct dependency declaration already narrows this
+     in practice -- `mimalloc = "0.1.52"` (`ext/helix_rack/Cargo.toml`) is a Cargo caret requirement, which
+     on a pre-1.0 crate only admits patch-level bumps (`0.1.z`, `z` >= 52), not a silent jump to a
+     different vendored mimalloc *major* -- confirmed against the
      actual resolved graph via `cargo tree -p mimalloc -p libmimalloc-sys`, which shows exactly
      `libmimalloc-sys v0.1.49` / `mimalloc v0.1.52` today, matching the `Cargo.toml` minimums exactly.
      Not pinning `Cargo.lock` itself, or switching to exact (`=`) version requirements, was judged a
@@ -785,6 +810,15 @@ platforms.
 0, then `helix_rack --version` and `helix_rack --help` produce expected exact output. No build
 tools present in that container — proves it's truly precompiled, not silently falling back to
 source compilation.
+
+**Known input from Phase 10:** a `workflow_dispatch` run of `build-gems.yml` (Phase 10's Resolution
+note, second safety-review round, finding 2) found `x64-mingw-ucrt` fails to cross-compile at all --
+mimalloc's vendored C source hits a genuine, currently-open upstream mingw-w64/Windows-SDK-header
+incompatibility (`ERROR_COMMITMENT_MINIMUM` undeclared), unrelated to this project's own code. Every
+other real deployment platform (both Linux libc flavors and both glibc/musl variants, both macOS
+architectures) built cleanly. This phase needs to decide: exclude `x64-mingw-ucrt` from the shipped
+platform list (matching the existing `exclude: ["arm-linux", "x64-mingw32"]` precedent in
+`build-gems.yml`'s `ci-data` job), or revisit once upstream fixes it -- not decided yet.
 
 ## Phase 13 — Benchmarking (PRD section 7.2) — explicitly NOT deterministic, treat differently
 
