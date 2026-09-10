@@ -14,3 +14,17 @@ path = "src/lib.rs"
 [dependencies]
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "fs", "sync"] }
 httparse = "1"
+
+# Linux-only, not a plain dependency: a safety-review finding on Phase 9
+# (PLAN.md, Phase 9) caught that `io-uring` calls Linux-only libc symbols
+# (`MAP_POPULATE`, `MADV_DONTFORK`, `SYS_io_uring_setup`, `cpu_set_t`)
+# directly, with no `cfg` guards of its own -- verified concretely with
+# `cargo check --target x86_64-apple-darwin`, which failed to compile. An
+# unconditional dependency would have made this whole crate (previously
+# portable: just `tokio` + `httparse`) Linux-only, and would have broken
+# `rake-compiler-dock` cross-gem builds for non-Linux platforms the next
+# time this project tags a release. See `engine/src/io_backend.rs` for the
+# matching `#[cfg(target_os = "linux")]` split on the probe function itself.
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7.15"
+libc = "0.2"

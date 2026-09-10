@@ -137,6 +137,12 @@ Grape/Rack existentes.
 * RNF02 - Mecanismo de I/O: Utilização de ring buffers compartilhados (io_uring) para submissão e
   conclusão de I/O de rede com zero syscalls no modo polling (SQPOLL), quando suportado pelo
   kernel Linux.
+  > Nota (PLAN.md, Fase 9): investigação feita durante a Fase 9 encontrou que isto não é viável
+  > sem reescrever o motor de rede do zero -- o Tokio não tem backend io_uring, e a única
+  > alternativa real (`tokio-uring`) é um runtime separado, incompatível com o design atual de
+  > buffers zero-copy deste projeto. A Fase 9 entregou uma sondagem de capacidade real e honesta
+  > (diagnóstico apenas), não uma troca de backend de rede -- ver a "Architecture note" da Fase 9
+  > em PLAN.md para os detalhes verificados.
 * RNF03 - Alocador de Memória: O binário nativo compilado deve utilizar jemalloc ou mimalloc para
   gerenciar a heap do servidor, evitando fragmentação de memória.
 

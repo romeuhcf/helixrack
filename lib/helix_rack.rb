@@ -235,4 +235,30 @@ module HelixRack
   def self.postponed_job_count
     _postponed_job_count
   end
+
+  # Phase 9 (`PLAN.md`, Phase 9): `"io_uring"` or `"epoll"`, whichever a real
+  # `io_uring_setup(2)` syscall attempt found this kernel supports -- see
+  # `engine/src/io_backend.rs`'s own doc comment for how, and for why this is
+  # diagnostic only: `HelixRack.serve`'s actual network I/O always runs on
+  # Tokio's own (epoll, on Linux) reactor regardless of what this returns.
+  #
+  # Memoized: a safety-review finding on this phase measured
+  # `_io_backend_probe`'s underlying syscall + mmap/munmap sequence at
+  # ~5.6us/call, held under the GVL the whole time (this native call makes
+  # no `gvl::without_gvl` attempt -- not worth it for a call this cheap, and
+  # boxing an `AtomicBool` plus registering an unblock function would
+  # plausibly cost more than the ~5.6us it would be protecting). Negligible
+  # for the one call `exe/helix_rack` makes at startup, but the underlying
+  # kernel capability can't change mid-process anyway, so there's no reason
+  # a caller who queries this repeatedly (a monitoring endpoint, say) should
+  # pay a GVL-held blocking-syscall cost more than once. `@io_backend` is a
+  # module-level ivar, the same pattern `@trap_generation` (top of this
+  # file) already uses for process-lifetime state -- no mutex here, unlike
+  # that one: two threads racing to compute this for the first time would
+  # both independently reach the same deterministic answer and both write
+  # it, a harmless benign race, not the kind `@trap_generation` has to guard
+  # against.
+  def self.io_backend
+    @io_backend ||= _io_backend_probe
+  end
 end
