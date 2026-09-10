@@ -725,8 +725,15 @@ what's linked. Deterministic yes/no, no runtime measurement needed.
      Linux-only dependency that broke non-Linux builds, caught only by an actual cross-compile attempt).
      Judged safe to trigger without separate confirmation: the workflow only builds gems and uploads them
      as private, auto-expiring GitHub Actions artifacts (`actions/upload-artifact`), it publishes nothing
-     external, and it's the same kind of repo-internal CI this project already runs on every PR. Result
-     recorded below once the run completes.
+     external, and it's the same kind of repo-internal CI this project already runs on every PR.
+     Worth doing: the first-ever run of this workflow (it had only ever fired on a tag push or manual
+     dispatch before, neither of which had happened yet) immediately found a real, pre-existing gap
+     unrelated to mimalloc -- `source-gem` and every `cross-gem` matrix job's `ruby/setup-ruby@v1` step
+     omitted `ruby-version`, which needs a committed `.ruby-version`/`.tool-versions` file to resolve a
+     "default" version; this repo has neither (`main.yml`'s own equivalent step always passed an explicit
+     `ruby-version: ${{ matrix.ruby }}`, so this codepath was never exercised there). Fixed by pinning
+     `ruby-version: '4.0.6'` explicitly in both steps, matching `main.yml`'s own pinned version. Re-run
+     after the fix to confirm.
   3. **[Low, documented]** `Cargo.lock` is gitignored (`.gitignore:21`, a pre-existing, unmodified
      project choice -- matching how `rb_sys`-based extension gems typically avoid pinning dependents'
      resolution), so a fresh `cargo build` re-resolves `mimalloc`/`libmimalloc-sys` versions each time
