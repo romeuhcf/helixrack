@@ -18,8 +18,18 @@ require_relative "helix_rack/version"
 # and needs to keep working unchanged.
 begin
   RUBY_VERSION =~ /(\d+\.\d+)/
-  require_relative "helix_rack/#{Regexp.last_match(1)}/helix_rack"
-rescue LoadError
+  versioned_extension_path = "helix_rack/#{Regexp.last_match(1)}/helix_rack"
+  require_relative versioned_extension_path
+rescue LoadError => e
+  # CodeRabbit finding: a bare `rescue LoadError` here would also catch a
+  # `LoadError` raised *while* loading the versioned extension itself (a
+  # dependency failure, a corrupted `.so`) and mask it behind a second,
+  # more confusing failure from the fallback attempt below. Checking
+  # `e.path` narrows this to exactly the case this rescue exists for --
+  # the versioned file genuinely isn't there -- and re-raises anything else
+  # unchanged, with its original backtrace intact.
+  raise unless e.path&.end_with?(versioned_extension_path)
+
   require "helix_rack/helix_rack"
 end
 

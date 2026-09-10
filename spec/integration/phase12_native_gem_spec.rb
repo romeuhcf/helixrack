@@ -46,15 +46,34 @@ RSpec.describe "Phase 12: native gem installs and runs with no build toolchain (
     pkg_dir = File.dirname(GEM_PATH)
     gem_filename = File.basename(GEM_PATH)
 
+    # Two CodeRabbit findings fixed here, both real:
+    # - `which gcc cc cargo rustc make` (a single command) exits nonzero the
+    #   moment *any one* tool is missing, so the original `... && echo no ||
+    #   echo yes` reported "yes" (absent) even with e.g. `make` present and
+    #   only `cargo` missing -- checked each tool independently instead,
+    #   `TOOLCHAIN_ABSENT=yes` only when *none* of them resolve.
+    # - `echo "X=$(cmd)"; echo "EXIT=$?"` captures `echo`'s own exit status
+    #   (always 0 once the substitution has *some* output), not `cmd`'s --
+    #   captured each command's real status via an `if`/`else` instead, so a
+    #   `helix_rack` that printed the right text but exited nonzero would no
+    #   longer pass.
     script = <<~SCRIPT
       set -e
-      echo "TOOLCHAIN_ABSENT=$(which gcc cc cargo rustc make >/dev/null 2>&1 && echo no || echo yes)"
+      if command -v gcc >/dev/null 2>&1 || command -v cc >/dev/null 2>&1 ||
+         command -v cargo >/dev/null 2>&1 || command -v rustc >/dev/null 2>&1 ||
+         command -v make >/dev/null 2>&1; then
+        echo "TOOLCHAIN_ABSENT=no"
+      else
+        echo "TOOLCHAIN_ABSENT=yes"
+      fi
       gem install "/pkg/#{gem_filename}" --no-document >/dev/null
       echo "INSTALL_EXIT=$?"
-      echo "VERSION_OUTPUT=$(helix_rack --version)"
-      echo "VERSION_EXIT=$?"
-      echo "HELP_FIRST_LINE=$(helix_rack --help | head -1)"
-      echo "HELP_EXIT=$?"
+      if version_output="$(helix_rack --version)"; then version_exit=0; else version_exit=$?; fi
+      if help_output="$(helix_rack --help)"; then help_exit=0; else help_exit=$?; fi
+      echo "VERSION_OUTPUT=$version_output"
+      echo "VERSION_EXIT=$version_exit"
+      echo "HELP_FIRST_LINE=$(printf '%s\\n' "$help_output" | head -n 1)"
+      echo "HELP_EXIT=$help_exit"
     SCRIPT
 
     stdout, status = Open3.capture2(

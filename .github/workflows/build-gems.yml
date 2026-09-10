@@ -8,9 +8,11 @@ on:
       - "cross-gem/*"
   workflow_dispatch:
 
+# CodeRabbit finding: `packages: write` was unused -- no step in this
+# workflow publishes a package (it only builds gems and uploads them as
+# workflow artifacts), so it granted more than any step needs.
 permissions:
   contents: read
-  packages: write
 
 jobs:
   ci-data:
@@ -46,6 +48,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          # CodeRabbit finding (CWE-522): defaults to true, which persists
+          # GITHUB_TOKEN in this job's local git config -- unneeded here,
+          # nothing in this workflow pushes or otherwise re-authenticates.
+          persist-credentials: false
 
       - uses: ruby/setup-ruby@v1
         with:
@@ -70,6 +77,11 @@ jobs:
         platform: ${{ fromJSON(needs.ci-data.outputs.result).supported-ruby-platforms }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          # CodeRabbit finding (CWE-522): defaults to true, which persists
+          # GITHUB_TOKEN in this job's local git config -- unneeded here,
+          # nothing in this workflow pushes or otherwise re-authenticates.
+          persist-credentials: false
 
       - uses: ruby/setup-ruby@v1
         with:
@@ -100,6 +112,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          # CodeRabbit finding (CWE-522): defaults to true, which persists
+          # GITHUB_TOKEN in this job's local git config -- unneeded here,
+          # nothing in this workflow pushes or otherwise re-authenticates.
+          persist-credentials: false
 
       - uses: ruby/setup-ruby@v1
         with:
