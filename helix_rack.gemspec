@@ -13,7 +13,18 @@ Gem::Specification.new do |spec|
                       "via rb-sys/magnus, built for high throughput under tight CPU limits."
   spec.homepage = "https://github.com/romeuhcf/helixrack"
   spec.license = "MIT"
-  spec.required_ruby_version = ">= 3.2.0"
+  # Phase 12 (PLAN.md, Phase 12): was ">= 3.2.0" until a real multi-Ruby-
+  # version cross-compile attempt (`rake gem:native`, backing this phase's
+  # packaging gate) proved that wrong -- Ruby 3.2.11's own C headers don't
+  # declare `rb_postponed_job_preregister`/`rb_postponed_job_trigger`
+  # (`ext/helix_rack/src/lib.rs`'s Phase 6 preemption mechanism uses both
+  # unconditionally, no version-gated fallback), and the build genuinely
+  # failed with `cannot find function` for exactly those symbols. Verified
+  # (web search, not assumed) that both were added in Ruby 3.3.0 -- Ruby 3.2
+  # itself reached its own end of life on 2026-03-31, already past by the
+  # time this was caught, so narrowing here costs nothing currently
+  # supported. See PLAN.md's Phase 12 Resolution note.
+  spec.required_ruby_version = ">= 3.3.0"
   spec.metadata["homepage_uri"] = spec.homepage
   spec.metadata["source_code_uri"] = "https://github.com/romeuhcf/helixrack"
   spec.metadata["rubygems_mfa_required"] = "true"

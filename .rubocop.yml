@@ -1,5 +1,9 @@
+# Phase 12 (PLAN.md, Phase 12): kept in sync with helix_rack.gemspec's
+# required_ruby_version -- that file's own comment explains why it's 3.3,
+# not 3.2 (rubocop's own Gemspec/RequiredRubyVersion cop flags a mismatch
+# between the two, which is how this got caught).
 AllCops:
-  TargetRubyVersion: 3.2
+  TargetRubyVersion: 3.3
 
 Style/StringLiterals:
   EnforcedStyle: double_quotes
