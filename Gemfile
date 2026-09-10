@@ -25,3 +25,12 @@ gem "rspec", "~> 3.0"
 gem "grape", "~> 4.0"
 
 gem "rubocop", "~> 1.21"
+
+# Phase 13 (PLAN.md, Phase 13): comparison baselines/backends for the
+# benchmark harness under `bench/` -- PRD.md section 7.2 asks for HelixRack
+# vs Puma vs Falcon. Bench-only, never loaded by HelixRack itself or by its
+# own test suite; installed inside `bench/Dockerfile`'s image, not the
+# runtime gemspec.
+gem "falcon", "~> 0.57"
+gem "pg", "~> 1.6"
+gem "puma", "~> 8.0"

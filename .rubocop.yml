@@ -10,3 +10,18 @@ Style/StringLiterals:
 
 Style/StringLiteralsInInterpolation:
   EnforcedStyle: double_quotes
+
+# Phase 13 (PLAN.md, Phase 13): `bench/run.rb` is a standalone orchestration
+# script (build an image, boot containers, drive k6, compute a gate), not
+# library code under `lib/`/`ext/` -- it genuinely reads better as a handful
+# of longer, sequential, single-purpose methods matching its own procedural
+# nature than fragmented to satisfy a line-count/complexity budget meant for
+# reusable API code. Scoped to `bench/**/*` only; `lib/`/`ext/`/`engine/`
+# keep the default budgets.
+Metrics:
+  Exclude:
+    - "bench/**/*"
+
+Style/Documentation:
+  Exclude:
+    - "bench/**/*"

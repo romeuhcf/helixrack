@@ -35,7 +35,10 @@ Gem::Specification.new do |spec|
   spec.files = IO.popen(%w[git ls-files -z], chdir: __dir__, err: IO::NULL) do |ls|
     ls.readlines("\x0", chomp: true).reject do |f|
       (f == gemspec) ||
-        f.start_with?(*%w[bin/ Gemfile .gitignore .rspec spec/ .github/ .rubocop.yml])
+        # `bench/` (Phase 13, PLAN.md): the benchmark harness (Dockerfile,
+        # scenario apps, k6 scripts) is build/test tooling, not something a
+        # gem consumer needs shipped -- same reasoning as `spec/`/`.github/`.
+        f.start_with?(*%w[bin/ Gemfile .gitignore .rspec spec/ .github/ .rubocop.yml bench/])
     end
   end
   spec.bindir = "exe"
