@@ -1238,8 +1238,11 @@ on top of `TCP_NODELAY`, kept feature-gated rather than made the default -- see 
   `hello_world` p99 dropped ~82% (a single small in-memory body, response size dominated by per-request
   overhead, exactly where one fewer syscall/segment matters most); `io_mixed` dropped ~23% (a real
   Postgres round trip dominates that scenario's latency, so the same fixed per-request saving is a
-  smaller fraction of the total). RSS unaffected either way, as expected -- this changes write-syscall
-  count, not allocation behavior.
+  smaller fraction of the total). RSS unaffected either way in this benchmark -- not because the
+  feature is allocation-free (`write_response`'s `combined.extend_from_slice(bytes)` does copy the
+  body into the head `Vec`'s buffer, and can reallocate it), but because the response bodies these two
+  scenarios use are small enough that neither the copy nor a possible reallocation shows up against
+  cgroup `memory.peak`'s coarser measurement.
 - **Left feature-gated, not flipped to the default, for now**: the result is real and consistent in
   direction across both scenarios, but this specific A/B run's noisier host conditions (noted above)
   make its *absolute* magnitude less trustworthy than the controlled `TCP_NODELAY` measurement was --
